@@ -219,6 +219,16 @@ def _make_unique_columns(cols: Sequence[str]) -> List[str]:
     return out
 
 
+def safe_filename(name: str, max_len: int = 120) -> str:
+    """파일/ZIP 내부 경로에 안전하게 쓸 수 있도록 이름을 정리한다."""
+    s = str(name)
+    s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
+    s = re.sub(r"\s+", "_", s).strip("._ ")
+    if not s:
+        s = "unnamed"
+    return s[:max_len]
+
+
 def choose_crf_sheet(file_bytes: bytes, institution: str) -> str:
     """기관별 CRF 파일 또는 통합 CRF에서 해당 기관 sheet를 우선 선택한다."""
     sheets = read_excel_sheets_cached(file_bytes)
@@ -661,16 +671,23 @@ def build_crf_mapping_diagnostics(pair_df: pd.DataFrame, crf: pd.DataFrame) -> p
         trial = str(r["trial_id"]).lower()
         m = meta[meta["subject_id"].astype(str) == sid]
         crf_matched = not m.empty
+        status_col_present = trial in trial_cols
         status = np.nan
-        if crf_matched and trial in trial_cols:
+        if crf_matched and status_col_present:
             status = m.iloc[0][trial_cols[trial]]
         status_str = "" if pd.isna(status) else str(status).strip()
-        trial_usable_by_crf = status_str in VALID_TRIAL_STATUS or status_str.upper() in VALID_TRIAL_STATUS
+        trial_usable_by_crf = (
+            (not status_col_present)
+            or status_str in VALID_TRIAL_STATUS
+            or status_str.upper() in VALID_TRIAL_STATUS
+        )
         if not crf_matched:
             mapping_status = "crf_subject_unmatched"
         elif r["pair_status"] not in {"paired", "mot_only"}:
             mapping_status = "mot_missing"
-        elif status_str and not trial_usable_by_crf:
+        elif status_col_present and not status_str:
+            mapping_status = "crf_trial_status_blank"
+        elif status_col_present and not trial_usable_by_crf:
             mapping_status = "crf_trial_not_usable"
         else:
             mapping_status = "ok"
@@ -681,6 +698,7 @@ def build_crf_mapping_diagnostics(pair_df: pd.DataFrame, crf: pd.DataFrame) -> p
                 "trial_id": r["trial_id"],
                 "pair_status": r["pair_status"],
                 "crf_subject_matched": crf_matched,
+                "crf_trial_status_col_present": bool(status_col_present),
                 "crf_trial_status": status_str,
                 "trial_usable_by_crf": bool(trial_usable_by_crf),
                 "mapping_status": mapping_status,
@@ -1255,6 +1273,7 @@ def plot_fda_group_mean(
     title: str,
     show_significance: bool = True,
     alpha: float = 0.05,
+    stance_pct: float = 60.0,
 ) -> plt.Figure:
     meta2 = meta.copy()
     meta2[subject_col] = meta2[subject_col].astype(str)
@@ -1300,8 +1319,8 @@ def plot_fda_group_mean(
                 y_sig = ymin + 0.04 * (ymax - ymin)
                 ax.scatter(grid[sig], np.full(sig.sum(), y_sig), s=10, marker="|", label=f"FDR q<{alpha}")
 
-    ax.axvline(60, linestyle="--", linewidth=1, alpha=0.55)
-    ax.text(60, ax.get_ylim()[1], "  stance/swing", va="top", fontsize=9)
+    ax.axvline(stance_pct, linestyle="--", linewidth=1, alpha=0.55)
+    ax.text(stance_pct, ax.get_ylim()[1], "  stance/swing", va="top", fontsize=9)
     ax.set_xlabel("Gait cycle (%)")
     ax.set_ylabel("Adjusted curve value")
     ax.set_title(title)
@@ -1529,6 +1548,13 @@ def transform_feature_train_test_no_leakage(
 
 
 def compute_binary_metrics(y_true: np.ndarray, prob: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+    y_true = np.asarray(y_true)
+    prob = np.asarray(prob, dtype=float)
+    ok = np.isfinite(prob) & np.isfinite(y_true)
+    y_true = y_true[ok].astype(int)
+    prob = prob[ok]
+    if len(y_true) == 0:
+        return {"AUC": np.nan, "Accuracy": np.nan, "Sensitivity": np.nan, "Specificity": np.nan, "TP": 0, "FP": 0, "TN": 0, "FN": 0}
     pred = (prob >= threshold).astype(int)
     if len(np.unique(y_true)) == 2:
         auc_val = roc_auc_score(y_true, prob)
@@ -1680,12 +1706,18 @@ def run_no_leakage_ml(
 
 
 def plot_roc_from_oof(oof_df: pd.DataFrame) -> plt.Figure:
-    y = oof_df["y_true"].to_numpy(dtype=int)
+    y = oof_df["y_true"].to_numpy(dtype=float)
     p = oof_df["prob_disease"].to_numpy(dtype=float)
-    fpr, tpr, _ = roc_curve(y, p)
-    auc_val = auc(fpr, tpr)
+    ok = np.isfinite(y) & np.isfinite(p)
+    y = y[ok].astype(int)
+    p = p[ok]
     fig, ax = plt.subplots(figsize=(6.4, 5.2))
-    ax.plot(fpr, tpr, label=f"OOF ROC AUC={auc_val:.3f}")
+    if len(np.unique(y)) == 2 and len(y) > 1:
+        fpr, tpr, _ = roc_curve(y, p)
+        auc_val = auc(fpr, tpr)
+        ax.plot(fpr, tpr, label=f"OOF ROC AUC={auc_val:.3f}")
+    else:
+        ax.text(0.5, 0.5, "ROC 계산에 필요한 두 그룹의 OOF 예측이 부족합니다.", ha="center", va="center")
     ax.plot([0, 1], [0, 1], linestyle="--", alpha=0.6)
     ax.set_xlabel("1 - Specificity")
     ax.set_ylabel("Sensitivity")
@@ -1695,6 +1727,96 @@ def plot_roc_from_oof(oof_df: pd.DataFrame) -> plt.Figure:
     fig.tight_layout()
     return fig
 
+
+
+
+# =============================================================================
+# Streamlit 실행 상태 관리
+# =============================================================================
+
+PARSED_STATE_KEYS = [
+    "file_index", "parsed_uploads", "skipped_files", "pair_df", "crf", "crf_mapping_df",
+    "upload_signature", "parse_done",
+]
+
+ANALYSIS_STATE_KEYS = [
+    "curve_long", "qc_df", "excluded_df", "raw_matrices", "adjusted_matrices", "adjusted_long",
+    "scores_long", "scores_wide", "loadings_long", "evr_df", "fpca_tests_df",
+    "clinical_corr_df", "ml_fold_df", "ml_oof_metrics_df", "ml_oof_df", "ml_coef_summary",
+    "full_results_zip_bytes",
+    "last_preprocess_run_id", "last_fpca_run_id", "pending_analysis_run_id",
+]
+
+
+def clear_analysis_state() -> None:
+    """파싱 결과는 유지하고, 전처리 이후 분석 결과만 초기화한다."""
+    for key in ANALYSIS_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def clear_parsed_and_analysis_state() -> None:
+    """업로드 파싱 결과와 분석 결과를 모두 초기화한다."""
+    for key in PARSED_STATE_KEYS + ANALYSIS_STATE_KEYS:
+        st.session_state.pop(key, None)
+
+
+def make_upload_signature(
+    institution_zip_files: Dict[str, object],
+    institution_crf_files: Dict[str, object],
+    walking_regex: str,
+    use_crf_trial_filter: bool,
+) -> str:
+    """업로드 파일/파싱 옵션 변경 여부를 감지하기 위한 가벼운 signature."""
+    rows = [
+        ("walking_regex", str(walking_regex)),
+        ("use_crf_trial_filter", bool(use_crf_trial_filter)),
+    ]
+    for inst in INSTITUTIONS:
+        z = institution_zip_files.get(inst)
+        c = institution_crf_files.get(inst)
+        rows.append((inst, "zip", getattr(z, "name", None), getattr(z, "size", None)))
+        rows.append((inst, "crf", getattr(c, "name", None), getattr(c, "size", None)))
+    return repr(rows)
+
+
+def parse_uploaded_inputs_once(
+    institution_zip_files: Dict[str, object],
+    institution_crf_files: Dict[str, object],
+    walking_regex: str,
+    use_crf_trial_filter: bool,
+) -> Tuple[pd.DataFrame, Dict[str, ParsedUpload], pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """기관별 ZIP/CRF를 한 번 파싱하고, CRF trial filter까지 반영한다."""
+    file_index, parsed, skipped_files, pair_df = build_upload_index_from_institution_zips(
+        institution_zip_files,
+        walking_regex=walking_regex,
+    )
+
+    crf_frames = []
+    for inst, f in institution_crf_files.items():
+        if f is not None:
+            crf_frames.append(read_institution_crf(f, inst))
+    crf = pd.concat(crf_frames, ignore_index=True, sort=False) if crf_frames else pd.DataFrame()
+    crf_mapping_df = build_crf_mapping_diagnostics(pair_df, crf) if not crf.empty else pd.DataFrame()
+
+    if use_crf_trial_filter and not crf_mapping_df.empty:
+        has_any_trial_status_col = bool(crf_mapping_df.get("crf_trial_status_col_present", pd.Series(dtype=bool)).any())
+        if has_any_trial_status_col:
+            allowed = crf_mapping_df.loc[
+                crf_mapping_df["trial_usable_by_crf"] & crf_mapping_df["mapping_status"].isin(["ok"]),
+                ["institution", "subject_id", "trial_id"],
+            ]
+            allowed_keys = set(map(tuple, allowed.astype(str).to_numpy()))
+            if not file_index.empty:
+                file_index = file_index[
+                    file_index[["institution", "subject_id", "trial_id"]].astype(str).apply(tuple, axis=1).isin(allowed_keys)
+                ].reset_index(drop=True)
+            pair_df = build_trial_pair_diagnostics(file_index)
+            parsed = {
+                k: v for k, v in parsed.items()
+                if (str(v.institution), str(v.subject_id), str(v.trial_id)) in allowed_keys
+            }
+
+    return file_index, parsed, skipped_files, pair_df, crf, crf_mapping_df
 
 # =============================================================================
 # Streamlit UI
@@ -1744,53 +1866,77 @@ logistic_c = st.sidebar.number_input("Logistic L2 C", min_value=0.001, max_value
 random_seed = st.sidebar.number_input("Random seed", min_value=0, max_value=99999, value=42, step=1)
 
 # -------------------------------
-# 파일 파싱
+# 실행 제어
 # -------------------------------
 
-parsed: Dict[str, ParsedUpload] = {}
-file_index = pd.DataFrame()
-skipped_files = pd.DataFrame()
-pair_df = pd.DataFrame()
-crf = pd.DataFrame()
-crf_mapping_df = pd.DataFrame()
+st.sidebar.header("5) 실행 제어")
+current_upload_signature = make_upload_signature(
+    institution_zip_files,
+    institution_crf_files,
+    walking_regex,
+    use_crf_trial_filter,
+)
 
-if any(institution_zip_files.values()):
-    with st.spinner("기관별 ZIP에서 6m walking MOT/TRC를 파싱하는 중..."):
-        file_index, parsed, skipped_files, pair_df = build_upload_index_from_institution_zips(
-            institution_zip_files,
-            walking_regex=walking_regex,
-        )
+parse_clicked = st.sidebar.button("① 업로드 자료 파싱/매핑 실행", type="primary", use_container_width=True)
+analysis_clicked = st.sidebar.button("② 분석 시작", use_container_width=True)
+clear_clicked = st.sidebar.button("파싱/분석 결과 초기화", use_container_width=True)
 
-crf_frames = []
-for inst, f in institution_crf_files.items():
-    if f is not None:
+if clear_clicked:
+    clear_parsed_and_analysis_state()
+    st.sidebar.success("파싱 및 분석 결과를 초기화했습니다.")
+
+if parse_clicked:
+    if not any(institution_zip_files.values()):
+        st.sidebar.error("최소 1개 기관의 검사 데이터 ZIP을 업로드하세요.")
+    else:
         try:
-            crf_frames.append(read_institution_crf(f, inst))
+            with st.spinner("기관별 ZIP/CRF를 파싱하고 매핑 진단을 생성하는 중..."):
+                file_index_p, parsed_p, skipped_files_p, pair_df_p, crf_p, crf_mapping_df_p = parse_uploaded_inputs_once(
+                    institution_zip_files=institution_zip_files,
+                    institution_crf_files=institution_crf_files,
+                    walking_regex=walking_regex,
+                    use_crf_trial_filter=use_crf_trial_filter,
+                )
+            st.session_state["file_index"] = file_index_p
+            st.session_state["parsed_uploads"] = parsed_p
+            st.session_state["skipped_files"] = skipped_files_p
+            st.session_state["pair_df"] = pair_df_p
+            st.session_state["crf"] = crf_p
+            st.session_state["crf_mapping_df"] = crf_mapping_df_p
+            st.session_state["upload_signature"] = current_upload_signature
+            st.session_state["parse_done"] = True
+            clear_analysis_state()
+            st.sidebar.success("파싱/매핑 완료. 이제 파라미터와 변수 선택 후 분석을 시작하세요.")
         except Exception as e:
-            st.sidebar.error(f"{inst} CRF 파싱 오류: {e}")
-if crf_frames:
-    crf = pd.concat(crf_frames, ignore_index=True, sort=False)
-    crf_mapping_df = build_crf_mapping_diagnostics(pair_df, crf)
+            st.sidebar.error(f"파싱/매핑 중 오류: {e}")
 
-    # CRF의 6m_1/6m_2/6m_3 사용 가능 여부가 있으면, 기본적으로 O/△ trial만 분석에 포함한다.
-    if use_crf_trial_filter and not crf_mapping_df.empty:
-        allowed = crf_mapping_df.loc[
-            crf_mapping_df["trial_usable_by_crf"] & crf_mapping_df["mapping_status"].isin(["ok"]),
-            ["institution", "subject_id", "trial_id"],
-        ]
-        allowed_keys = set(map(tuple, allowed.astype(str).to_numpy()))
-        if allowed_keys:
-            file_index = file_index[
-                file_index[["institution", "subject_id", "trial_id"]].astype(str).apply(tuple, axis=1).isin(allowed_keys)
-            ].reset_index(drop=True)
-            pair_df = build_trial_pair_diagnostics(file_index)
-            parsed = {
-                k: v for k, v in parsed.items()
-                if (str(v.institution), str(v.subject_id), str(v.trial_id)) in allowed_keys
-            }
+# 파싱된 결과는 session_state에서만 가져온다. rerun마다 ZIP을 다시 풀지 않는다.
+parsed: Dict[str, ParsedUpload] = st.session_state.get("parsed_uploads", {})
+file_index = st.session_state.get("file_index", pd.DataFrame())
+skipped_files = st.session_state.get("skipped_files", pd.DataFrame())
+pair_df = st.session_state.get("pair_df", pd.DataFrame())
+crf = st.session_state.get("crf", pd.DataFrame())
+crf_mapping_df = st.session_state.get("crf_mapping_df", pd.DataFrame())
 
+if st.session_state.get("parse_done", False):
+    if st.session_state.get("upload_signature") != current_upload_signature:
+        st.sidebar.warning("업로드 파일 또는 walking/CRF 필터 옵션이 변경되었습니다. 다시 파싱/매핑 실행을 눌러주세요.")
+    else:
+        st.sidebar.success("파싱된 업로드 자료를 사용 중입니다. 분석 시 ZIP을 다시 파싱하지 않습니다.")
+
+if analysis_clicked:
+    if not st.session_state.get("parse_done", False) or not parsed:
+        st.sidebar.error("먼저 ① 업로드 자료 파싱/매핑 실행을 완료하세요.")
+    else:
+        clear_analysis_state()
+        next_run_id = int(st.session_state.get("analysis_run_id", 0)) + 1
+        st.session_state["analysis_run_id"] = next_run_id
+        st.session_state["pending_analysis_run_id"] = next_run_id
+        st.sidebar.success("분석 시작 신호를 보냈습니다. 현재 선택된 파라미터와 변수로 전처리/FDA/fPCA를 실행합니다.")
+
+# -------------------------------
 # Sidebar sample size
-st.sidebar.header("5) 데이터 샘플 사이즈")
+st.sidebar.header("6) 데이터 샘플 사이즈")
 if not file_index.empty:
     mot_counts = file_index[file_index["file_type"] == "MOT"].groupby(["institution", "subject_id"]).size().rename("n_mot")
     trc_counts = file_index[file_index["file_type"] == "TRC"].groupby(["institution", "subject_id"]).size().rename("n_trc")
@@ -1886,8 +2032,17 @@ with tab_upload:
 
         group_values = crf_tmp[group_col].dropna().astype(str).unique().tolist()
         if group_values:
-            control_label = st.selectbox("정상군 label", group_values, index=0, key="control_label")
-            disease_default_idx = 1 if len(group_values) > 1 else 0
+            control_default_idx = next(
+                (i for i, v in enumerate(group_values) if re.search(r"control|normal|healthy|hc|정상", v, flags=re.IGNORECASE)),
+                0,
+            )
+            disease_default_idx = next(
+                (i for i, v in enumerate(group_values) if re.search(r"parkinson|pd|disease|patient|환자|질환", v, flags=re.IGNORECASE)),
+                1 if len(group_values) > 1 else 0,
+            )
+            if disease_default_idx == control_default_idx and len(group_values) > 1:
+                disease_default_idx = 1 - control_default_idx if control_default_idx in [0, 1] else 1
+            control_label = st.selectbox("정상군 label", group_values, index=control_default_idx, key="control_label")
             disease_label = st.selectbox("질환군 label", group_values, index=disease_default_idx, key="disease_label")
         else:
             st.warning("그룹 컬럼에 값이 없습니다.")
@@ -1937,9 +2092,15 @@ with tab_pre:
 
         st.caption("처음 실행은 5~15개 주요 관절 변수로 확인하고, 이후 전체 변수로 확장하는 것을 권장합니다.")
 
-        if st.button("전처리 실행", type="primary"):
+        pending_run_id = st.session_state.get("pending_analysis_run_id", None)
+        run_pre_from_sidebar = pending_run_id is not None and st.session_state.get("last_preprocess_run_id") != pending_run_id
+        run_pre_now = st.button("전처리 실행", type="primary") or run_pre_from_sidebar
+
+        if run_pre_now:
             if not selected_features:
                 st.error("분석할 gait 변수를 최소 1개 선택하세요.")
+                if run_pre_from_sidebar:
+                    st.session_state["pending_analysis_run_id"] = None
             else:
                 with st.spinner("Gait curve 전처리 중..."):
                     long_df, qc_df, excluded_df = preprocess_to_subject_curves(
@@ -1955,6 +2116,8 @@ with tab_pre:
                     st.session_state["qc_df"] = qc_df
                     st.session_state["excluded_df"] = excluded_df
                     st.session_state["raw_matrices"] = long_to_feature_matrices(long_df)
+                    if pending_run_id is not None:
+                        st.session_state["last_preprocess_run_id"] = pending_run_id
                 st.success("전처리 완료")
 
         long_df = st.session_state.get("curve_long", pd.DataFrame())
@@ -1997,7 +2160,15 @@ with tab_fpca:
         crf_meta = crf.copy()
         crf_meta[subject_col] = crf_meta[subject_col].astype(str)
 
-        if st.button("공변량 보정 후 FDA/fPCA 실행", type="primary"):
+        pending_run_id = st.session_state.get("pending_analysis_run_id", None)
+        run_fpca_from_sidebar = (
+            pending_run_id is not None
+            and st.session_state.get("last_preprocess_run_id") == pending_run_id
+            and st.session_state.get("last_fpca_run_id") != pending_run_id
+        )
+        run_fpca_now = st.button("공변량 보정 후 FDA/fPCA 실행", type="primary") or run_fpca_from_sidebar
+
+        if run_fpca_now:
             with st.spinner("공변량 보정 및 fPCA 적합 중..."):
                 adjusted_matrices = adjust_all_feature_matrices(
                     raw_matrices,
@@ -2022,6 +2193,9 @@ with tab_fpca:
                 st.session_state["loadings_long"] = loadings_long
                 st.session_state["evr_df"] = evr_df
                 st.session_state["fpca_tests_df"] = tests_df
+                if pending_run_id is not None:
+                    st.session_state["last_fpca_run_id"] = pending_run_id
+                    st.session_state["pending_analysis_run_id"] = None
             st.success("FDA/fPCA 분석 완료")
 
         adjusted_matrices = st.session_state.get("adjusted_matrices", {})
@@ -2046,6 +2220,7 @@ with tab_fpca:
                     groups_to_plot=[control_label, disease_label],
                     title=f"Adjusted FDA curve: {selected_feat}",
                     show_significance=True,
+                    stance_pct=stance_pct,
                 )
                 st.pyplot(fig, clear_figure=True)
             with c2:
@@ -2153,6 +2328,7 @@ with tab_clinical:
                 groups_to_plot=selected_hy_levels,
                 title=f"Disease-only FDA curve by HY: {selected_feat_clin}",
                 show_significance=False,
+                stance_pct=stance_pct,
             )
             st.pyplot(fig, clear_figure=True)
 
@@ -2334,7 +2510,7 @@ def make_full_results_zip(include_figures: bool = True) -> bytes:
                     feat = list(adjusted_matrices.keys())[0]
                     crf_meta = crf.copy()
                     crf_meta[subject_col] = crf_meta[subject_col].astype(str)
-                    fig = plot_fda_group_mean(adjusted_matrices[feat], crf_meta, subject_col, group_col, [control_label, disease_label], f"FDA curve: {feat}", True)
+                    fig = plot_fda_group_mean(adjusted_matrices[feat], crf_meta, subject_col, group_col, [control_label, disease_label], f"FDA curve: {feat}", True, stance_pct=stance_pct)
                     zf.writestr(f"figures/fda_mean_curve_{safe_filename(feat)}.png", fig_to_png_bytes(fig))
                     plt.close(fig)
                     if not loadings_long.empty:
@@ -2355,12 +2531,22 @@ def make_full_results_zip(include_figures: bool = True) -> bytes:
     mem.seek(0)
     return mem.read()
 
-st.download_button(
-    "전체 분석 자료 ZIP 다운로드",
-    data=make_full_results_zip(include_figures=include_figures_in_zip),
-    file_name="opencap_gait_full_analysis_results.zip",
-    mime="application/zip",
-)
+if st.button("전체 분석 자료 ZIP 생성/갱신", use_container_width=True):
+    with st.spinner("전체 결과 ZIP을 생성하는 중..."):
+        st.session_state["full_results_zip_bytes"] = make_full_results_zip(include_figures=include_figures_in_zip)
+    st.success("전체 결과 ZIP 생성 완료")
+
+full_zip_bytes = st.session_state.get("full_results_zip_bytes", None)
+if full_zip_bytes is not None:
+    st.download_button(
+        "전체 분석 자료 ZIP 다운로드",
+        data=full_zip_bytes,
+        file_name="opencap_gait_full_analysis_results.zip",
+        mime="application/zip",
+        use_container_width=True,
+    )
+else:
+    st.info("전체 결과 ZIP은 버튼을 눌렀을 때만 생성합니다. 대용량 결과에서 불필요한 재생성을 막기 위한 설정입니다.")
 
 # =============================================================================
 # 하단 주의사항

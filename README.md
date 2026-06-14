@@ -2,6 +2,25 @@
 
 OpenCap walking 검사 자료(`.mot`, `.trc`)와 기관별 CRF를 업로드하여 gait curve 전처리, FDA/fPCA, 임상척도 연결, 누수 방지 ML 분석을 수행하는 Streamlit 앱입니다.
 
+## 핵심 실행 방식
+
+대용량 MOT/TRC ZIP을 매번 다시 파싱하지 않도록 실행 단계를 분리했습니다.
+
+1. 기관별 검사 데이터 ZIP과 CRF를 업로드합니다.
+2. 사이드바의 **① 업로드 자료 파싱/매핑 실행** 버튼을 누릅니다.
+   - ZIP 내부 파일을 한 번만 파싱합니다.
+   - 6m walking trial만 선별합니다.
+   - MOT/TRC pair와 CRF 매핑을 진단합니다.
+   - 파싱 결과는 `st.session_state`에 저장됩니다.
+3. 파라미터와 분석 변수를 조절합니다.
+4. 사이드바의 **② 분석 시작** 버튼을 누릅니다.
+   - 저장된 파싱 결과를 재사용합니다.
+   - ZIP을 다시 풀거나 MOT/TRC를 다시 읽지 않습니다.
+   - 전처리와 FDA/fPCA가 실행됩니다.
+5. ML은 계산량이 커서 기존처럼 ML 탭에서 별도 버튼으로 실행합니다.
+
+업로드 파일이나 walking/CRF 필터 옵션을 변경하면 다시 **① 업로드 자료 파싱/매핑 실행**을 눌러야 합니다.
+
 ## 입력 구조
 
 온라인 웹앱에서는 폴더를 직접 올리지 않고 **기관별 검사 데이터 ZIP**과 **기관별 CRF**를 업로드합니다.
@@ -76,10 +95,15 @@ streamlit run app.py
 
 ```text
 기관별 ZIP + 기관별 CRF 업로드
+→ ① 업로드 자료 파싱/매핑 실행
 → ZIP 내부 비식별 폴더에서 subject_id 추출
 → 6m walking trial만 선별
 → MOT/TRC pair 진단
 → CRF subject/trial 매핑 진단
+→ 파싱 결과 session_state 저장
+→ 파라미터/feature/covariate 조절
+→ ② 분석 시작
+→ 저장된 파싱 결과 재사용
 → 환자별 모든 usable walking MOT trial 통합
 → 결측 보정, spline smoothing, 0~100% 정규화
 → 환자 내 이상 trajectory 제외
@@ -87,5 +111,12 @@ streamlit run app.py
 → 공변량 보정 후 FDA/fPCA
 → 질환군 내 HY/UPDRS 임상 연결
 → fold 내부 fPCA 기반 leakage-free ML
+→ 전체 분석 자료 ZIP 생성/갱신 버튼 클릭
 → 전체 테이블/그래프/데이터 ZIP 다운로드
 ```
+
+## 성능 관련 변경
+
+- 업로드 ZIP/CRF 파싱은 사이드바의 **① 업로드 자료 파싱/매핑 실행**을 눌렀을 때만 수행됩니다.
+- 전처리/FDA/fPCA는 사이드바의 **② 분석 시작** 또는 각 탭의 개별 실행 버튼을 눌렀을 때만 수행됩니다.
+- 전체 결과 ZIP도 **전체 분석 자료 ZIP 생성/갱신** 버튼을 눌렀을 때만 생성됩니다.
