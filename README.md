@@ -1,15 +1,10 @@
-# OpenCap Gait Analysis Web Service
+# OpenCap Gait 분석 웹서비스
 
-Streamlit 기반 OpenCap walking MOT/TRC + CRF 분석 웹서비스입니다.
+OpenCap walking 검사 자료(`.mot`, `.trc`)와 기관별 CRF를 업로드하여 gait curve 전처리, FDA/fPCA, 임상척도 연결, 누수 방지 ML 분석을 수행하는 Streamlit 앱입니다.
 
-## 권장 업로드 방식
+## 입력 구조
 
-온라인 웹앱에서는 폴더를 그대로 업로드할 수 없으므로 **기관별 검사 데이터 폴더를 ZIP으로 압축해서 업로드**합니다. GitHub에는 데이터가 아니라 코드만 올립니다.
-
-앱 사이드바에서 기관별로 다음 2가지를 각각 업로드합니다.
-
-1. 기관 검사 데이터 ZIP
-2. 기관 CRF 파일(xlsx/xls/csv)
+온라인 웹앱에서는 폴더를 직접 올리지 않고 **기관별 검사 데이터 ZIP**과 **기관별 CRF**를 업로드합니다.
 
 예시:
 
@@ -28,42 +23,47 @@ UNI_gait.zip
    └─ 6m_1(1).trc
 ```
 
-또는 ZIP 내부에 기관 폴더가 한 번 더 있어도 됩니다.
+- MOT와 TRC는 같은 비식별 폴더 안에 있어도 됩니다.
+- 앱은 확장자로 `.mot`/`.trc`를 구분합니다.
+- `6m`, `6m_1`, `6m_2`, `6m_1(1)`처럼 walking trial만 분석합니다.
+- `TUG`, `standing`, 기타 검사는 자동 제외됩니다.
+
+CRF는 기관별로 업로드합니다.
 
 ```text
-UNI_gait.zip
-└─ UNI/
-   ├─ UNI1/
-   │  ├─ 6m_1.mot
-   │  └─ 6m_1.trc
-   └─ UNI2/
-      ├─ 6m_1.mot
-      └─ 6m_1.trc
+UNI_CRF.xlsx
+UUH_CRF.xlsx
+JBH_CRF.xlsx
 ```
 
-## 매핑 규칙
+## 그룹 분리
 
-- `institution`: 앱에서 선택한 기관 코드, 예: `UNI`, `UUH`, `JBH`
-- `subject_id`: ZIP 내부 비식별 폴더명에서 추출, 예: `UNI1`, `UUH1`, `JBH1`
-- `trial_id`: 파일명에서 추출, 예: `6m_1`, `6m_2`, `6m_3`
-- MOT/TRC 구분: 같은 폴더 내 파일 확장자 `.mot`, `.trc`로 구분
-- walking 선별: 기본 정규식 `^6m[_\- ]*\d*`에 맞는 파일만 분석에 포함
-- `TUG_1`, `TUG_2`, standing 등은 자동 제외
+기관 폴더명으로 정상군/질환군을 나누지 않습니다. 기관 내부에 정상군과 질환군이 섞여 있을 수 있으므로, CRF의 **`피험자군`** 변수를 기본 그룹 컬럼으로 사용합니다.
 
-## 분석 단위
-
-분석은 trial 단위가 아니라 **환자 단위 평균 curve**를 사용합니다.
+예:
 
 ```text
-각 subject의 모든 6m walking trial
-→ trial별 결측 보정
-→ 0~100% gait cycle 정규화
-→ spline smoothing
-→ subject 내부 outlier trial 제외
-→ 남은 trial 평균
-→ subject-feature mean curve 생성
-→ FDA/fPCA/임상척도/ML 분석
+피험자군 = Control
+피험자군 = Parkinson
 ```
+
+## CRF trial 상태값
+
+CRF의 `6m_1`, `6m_2`, `6m_3`에 기록된 사용 가능 여부를 진단합니다.
+
+- 기본값: `O`, `△` trial만 분석 포함
+- `X`, `-`, blank 등은 분석 제외 또는 확인 대상으로 표시
+
+## 업로드 용량
+
+`.streamlit/config.toml`에서 Streamlit 기본 200MB 업로드 제한을 4096MB로 올렸습니다.
+
+```toml
+[server]
+maxUploadSize = 4096
+```
+
+단, 온라인 배포 서버의 실제 메모리/디스크 제한은 별도로 영향을 줄 수 있습니다. 300MB 이상의 ZIP을 자주 처리한다면 Streamlit Community Cloud보다 Docker/VPS/기관 내부 서버 배포가 더 안정적일 수 있습니다.
 
 ## 실행
 
@@ -72,17 +72,20 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Streamlit Cloud 배포
+## 분석 흐름
 
-1. 이 저장소를 GitHub에 push
-2. Streamlit Community Cloud에서 New app
-3. Repository 선택
-4. Branch: `main`
-5. Main file path: `app.py`
-6. Deploy
-
-## 주의
-
-- 개인정보/원자료(MOT/TRC/CRF)는 GitHub에 올리지 않습니다.
-- 온라인 웹앱에서 업로드할 때만 ZIP으로 올립니다.
-- 대용량 자료는 서버 메모리 제한에 걸릴 수 있으므로, 기관별로 나누어 업로드하는 것을 권장합니다.
+```text
+기관별 ZIP + 기관별 CRF 업로드
+→ ZIP 내부 비식별 폴더에서 subject_id 추출
+→ 6m walking trial만 선별
+→ MOT/TRC pair 진단
+→ CRF subject/trial 매핑 진단
+→ 환자별 모든 usable walking MOT trial 통합
+→ 결측 보정, spline smoothing, 0~100% 정규화
+→ 환자 내 이상 trajectory 제외
+→ 환자당 feature별 mean curve 생성
+→ 공변량 보정 후 FDA/fPCA
+→ 질환군 내 HY/UPDRS 임상 연결
+→ fold 내부 fPCA 기반 leakage-free ML
+→ 전체 테이블/그래프/데이터 ZIP 다운로드
+```

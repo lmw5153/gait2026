@@ -1,6 +1,6 @@
-# Sample upload structure
+# 업로드 예시 구조
 
-기관별 ZIP 파일 내부 예시입니다.
+기관별 검사 데이터는 ZIP으로 압축해서 업로드합니다.
 
 ```text
 UNI_gait.zip
@@ -14,10 +14,4 @@ UNI_gait.zip
    └─ 6m_1.trc
 ```
 
-CRF는 앱에서 같은 기관 업로드 칸에 별도로 올립니다.
-
-```text
-UNI_CRF.xlsx
-UUH_CRF.xlsx
-JBH_CRF.xlsx
-```
+MOT와 TRC는 같은 폴더 안에 있어도 되며, 앱이 확장자로 구분합니다.
