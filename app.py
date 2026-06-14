@@ -3,13 +3,17 @@
 OpenCap Gait 분석 웹서비스 - Analysis-only Streamlit App
 
 이 앱은 원본 MOT/TRC를 직접 파싱하지 않는다.
-오프라인/별도 전처리 단계에서 생성한 환자별 gait mean curve long table과 CRF를 입력받아
-FDA/fPCA/임상척도 연결/누수 방지 ML 분석만 수행한다.
+오프라인/별도 전처리 단계에서 생성한 cycle별 MOT wide table 또는
+환자별 gait mean curve long table과 CRF를 입력받아 FDA/fPCA/임상척도 연결/누수 방지 ML 분석만 수행한다.
 
-필수 gait long table 컬럼:
+지원 입력 1: cycle별 MOT wide table
+    id, side, cycle, t0, t1, to, to_pct, phase, time, + 원본 MOT 변수들
+지원 입력 2: 환자별 gait long table
     subject_id, feature, grid_pct, value
-선택 컬럼:
-    institution, phase, n_trials_total, n_trials_kept
+
+주의:
+    cycle별 wide table을 올리면 앱 내부에서 원본 MOT 변수명을 그대로 유지한 채
+    cycle을 0~100% grid로 정규화하고 subject-feature 평균 curve를 생성한다.
 
 실행:
     streamlit run app.py
@@ -179,8 +183,38 @@ def read_preprocessed_gait_file(uploaded_file) -> pd.DataFrame:
     raise ValueError("전처리 gait 데이터는 CSV/XLSX/ZIP만 지원합니다.")
 
 
+
+def extract_subject_id_from_cycle_id(value, institution: str = "") -> str:
+    """cycle wide table의 id(UUH1_6m_1 등)에서 subject_id(UUH1)를 추출한다."""
+    raw = "" if pd.isna(value) else str(value).strip()
+    inst = str(institution).upper().strip()
+    if inst:
+        m = re.search(rf"({inst}\d+)", raw, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+    m = re.search(r"([A-Za-z]{2,5}\d+)", raw)
+    if m:
+        return m.group(1).upper()
+    # 흔한 형식: UUH1_6m_1 -> UUH1
+    return raw.split("_")[0].upper()
+
+
+def is_cycle_wide_gait_table(df: pd.DataFrame) -> bool:
+    """샘플 UUH1_6m_1_mot_by_cycle.csv 같은 cycle별 wide table인지 판단한다."""
+    if df.empty:
+        return False
+    cols = {_clean_col_name(c) for c in df.columns}
+    required_meta = {"id", "side", "cycle", "t0", "t1", "time"}
+    if not required_meta.issubset(cols):
+        return False
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    meta_like = {"cycle", "t0", "t1", "to", "to_pct", "time"}
+    motion_cols = [c for c in numeric_cols if _clean_col_name(c) not in meta_like]
+    return len(motion_cols) > 0
+
+
 def standardize_gait_long(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
-    """전처리 gait long table 컬럼을 표준화하고 오류를 반환한다."""
+    """이미 subject_id, feature, grid_pct, value 구조인 long table을 표준화한다."""
     errors: List[str] = []
     if df.empty:
         return df, ["전처리 gait 데이터가 비어 있습니다."]
@@ -188,9 +222,8 @@ def standardize_gait_long(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     out = df.copy()
     out.columns = [_clean_col_name(c) for c in out.columns]
 
-    # 흔한 alias 보정
+    # 흔한 alias 보정. cycle wide table의 id는 subject_id가 아니므로 여기서는 wide 판별 뒤에만 사용된다.
     alias = {
-        "id": "subject_id",
         "subject": "subject_id",
         "Subject": "subject_id",
         "SUBJECT_ID": "subject_id",
@@ -206,6 +239,10 @@ def standardize_gait_long(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         "adjusted_value": "value",
         "mean_value": "value",
     }
+    # id만 있는 long table을 허용하되, cycle wide table은 standardize_gait_input에서 먼저 분기된다.
+    if "subject_id" not in out.columns and "id" in out.columns:
+        alias["id"] = "subject_id"
+
     rename = {c: alias[c] for c in out.columns if c in alias and alias[c] not in out.columns}
     if rename:
         out = out.rename(columns=rename)
@@ -226,6 +263,153 @@ def standardize_gait_long(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     if out.empty:
         errors.append("필수 컬럼은 있지만 유효한 subject/feature/grid/value 행이 없습니다.")
     return out, errors
+
+
+def cycle_wide_to_subject_mean_long(
+    df: pd.DataFrame,
+    institution: str,
+    n_grid: int = 101,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """
+    cycle별 MOT wide table을 기존 분석 파이프라인용 subject-level long table로 변환한다.
+
+    입력 컬럼 예:
+        id, side, cycle, t0, t1, to, to_pct, phase, time,
+        pelvis_tilt, pelvis_list, ..., hip_flexion_r, ...
+
+    출력 컬럼:
+        institution, subject_id, feature, grid_pct, value, n_cycles_total, n_cycles_kept
+
+    원칙:
+        - 원본 MOT 변수명은 feature로 그대로 유지한다.
+        - ipsi/contra 등으로 바꾸지 않는다.
+        - cycle별 time을 t0~t1 기준 0~100%로 정규화한 뒤 subject-feature 평균을 낸다.
+    """
+    errors: List[str] = []
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame(), ["cycle wide 데이터가 비어 있습니다."]
+
+    work = df.copy()
+    work.columns = [_clean_col_name(c) for c in work.columns]
+    required = ["id", "side", "cycle", "t0", "t1", "time"]
+    missing = [c for c in required if c not in work.columns]
+    if missing:
+        return pd.DataFrame(), pd.DataFrame(), ["cycle wide 필수 컬럼 누락: " + ", ".join(missing)]
+
+    inst = str(institution).upper().strip()
+    meta_cols = {
+        "id", "side", "cycle", "t0", "t1", "to", "to_pct", "phase", "time",
+        "source_file", "institution", "subject_id", "trial_id",
+    }
+    numeric_cols = work.select_dtypes(include=[np.number]).columns.tolist()
+    feature_cols = [c for c in numeric_cols if c not in meta_cols]
+
+    if not feature_cols:
+        return pd.DataFrame(), pd.DataFrame(), ["cycle wide table에서 MOT numeric 변수 컬럼을 찾지 못했습니다."]
+
+    # cycle key 구성
+    work["id"] = work["id"].astype(str).str.strip()
+    work["side"] = work["side"].astype(str).str.strip()
+    work["cycle"] = work["cycle"].astype(str).str.strip()
+    work["subject_id"] = work["id"].apply(lambda x: extract_subject_id_from_cycle_id(x, inst))
+    work["cycle_key"] = work["id"] + "::" + work["side"] + "::" + work["cycle"]
+
+    grid = np.linspace(0, 100, int(n_grid))
+    cycle_long_parts: List[pd.DataFrame] = []
+    cycle_qc_rows: List[dict] = []
+
+    for cycle_key, sub in work.groupby("cycle_key", sort=False):
+        sub = sub.sort_values("time").copy()
+        sid = str(sub["subject_id"].iloc[0])
+        original_id = str(sub["id"].iloc[0])
+        side = str(sub["side"].iloc[0])
+        cycle_no = str(sub["cycle"].iloc[0])
+        t = pd.to_numeric(sub["time"], errors="coerce").to_numpy(dtype=float)
+        t0_series = pd.to_numeric(sub["t0"], errors="coerce").dropna()
+        t1_series = pd.to_numeric(sub["t1"], errors="coerce").dropna()
+        t0 = float(t0_series.iloc[0]) if len(t0_series) else np.nan
+        t1 = float(t1_series.iloc[0]) if len(t1_series) else np.nan
+        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            t0 = float(np.nanmin(t)) if np.isfinite(t).any() else np.nan
+            t1 = float(np.nanmax(t)) if np.isfinite(t).any() else np.nan
+        if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "invalid_cycle_time"})
+            continue
+
+        grid_pct_raw = 100.0 * (t - t0) / (t1 - t0)
+        ok_t = np.isfinite(grid_pct_raw)
+        grid_pct_raw = grid_pct_raw[ok_t]
+        sub_ok = sub.loc[ok_t].copy()
+        # 0~100 범위 밖은 제외
+        in_range = (grid_pct_raw >= 0) & (grid_pct_raw <= 100)
+        grid_pct_raw = grid_pct_raw[in_range]
+        sub_ok = sub_ok.loc[in_range].copy()
+        if len(grid_pct_raw) < 3:
+            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "too_few_points"})
+            continue
+
+        # 중복 time percent가 있으면 평균 처리하기 위해 feature별로 처리
+        feature_frames = []
+        for feat in feature_cols:
+            y = pd.to_numeric(sub_ok[feat], errors="coerce").to_numpy(dtype=float)
+            valid = np.isfinite(grid_pct_raw) & np.isfinite(y)
+            if valid.sum() < 3:
+                continue
+            tmp = pd.DataFrame({"grid_pct_raw": grid_pct_raw[valid], "value": y[valid]})
+            tmp = tmp.groupby("grid_pct_raw", as_index=False)["value"].mean().sort_values("grid_pct_raw")
+            if tmp.shape[0] < 3:
+                continue
+            try:
+                y_grid = np.interp(grid, tmp["grid_pct_raw"].to_numpy(dtype=float), tmp["value"].to_numpy(dtype=float))
+            except Exception:
+                continue
+            feature_frames.append(pd.DataFrame({
+                "institution": inst,
+                "subject_id": sid,
+                "original_id": original_id,
+                "cycle_key": cycle_key,
+                "side": side,
+                "cycle": cycle_no,
+                "feature": feat,
+                "grid_pct": grid,
+                "value": y_grid,
+            }))
+
+        if feature_frames:
+            cycle_long_parts.append(pd.concat(feature_frames, ignore_index=True))
+            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "ok", "n_features": len(feature_frames), "n_points": len(sub_ok)})
+        else:
+            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "no_valid_features"})
+
+    if not cycle_long_parts:
+        return pd.DataFrame(), pd.DataFrame(cycle_qc_rows), ["cycle wide table에서 유효한 cycle-feature curve를 만들지 못했습니다."]
+
+    cycle_long = pd.concat(cycle_long_parts, ignore_index=True)
+    subject_mean = (
+        cycle_long.groupby(["institution", "subject_id", "feature", "grid_pct"], as_index=False)
+        .agg(
+            value=("value", "mean"),
+            n_cycles_total=("cycle_key", "nunique"),
+            n_cycles_kept=("cycle_key", "nunique"),
+        )
+    )
+    subject_mean["input_format"] = "cycle_wide_mot_by_cycle"
+    qc_df = pd.DataFrame(cycle_qc_rows)
+    return subject_mean, qc_df, []
+
+
+def standardize_gait_input(df: pd.DataFrame, institution: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """long-format 또는 cycle-wide-format 전처리 결과를 분석용 subject-level long table로 표준화한다."""
+    if is_cycle_wide_gait_table(df):
+        return cycle_wide_to_subject_mean_long(df, institution=institution)
+    long_df, errors = standardize_gait_long(df)
+    if errors:
+        return long_df, pd.DataFrame(), errors
+    long_df = long_df.copy()
+    long_df["institution"] = str(institution).upper().strip()
+    long_df["subject_id"] = long_df["subject_id"].apply(lambda x: normalize_subject_id_value(x, institution))
+    long_df["input_format"] = "subject_mean_long"
+    return long_df, pd.DataFrame(), []
 
 
 def choose_crf_sheet(file_bytes: bytes, institution: str) -> str:
@@ -348,7 +532,7 @@ def merge_preprocessed_gait_files(gait_files: Dict[str, object]) -> Tuple[pd.Dat
         inst = inst.upper()
         try:
             raw = read_preprocessed_gait_file(f)
-            standardized, gait_errors = standardize_gait_long(raw)
+            standardized, cycle_qc, gait_errors = standardize_gait_input(raw, inst)
             if gait_errors:
                 errors.extend([f"{inst} gait 데이터 오류: {e}" for e in gait_errors])
                 diag_rows.append({
@@ -368,15 +552,19 @@ def merge_preprocessed_gait_files(gait_files: Dict[str, object]) -> Tuple[pd.Dat
             standardized["source_institution"] = inst
             standardized["source_upload_file"] = getattr(f, "name", "")
             frames.append(standardized)
+            input_format = standardized["input_format"].iloc[0] if "input_format" in standardized.columns and len(standardized) else "unknown"
             diag_rows.append({
                 "institution": inst,
                 "file_name": getattr(f, "name", ""),
                 "status": "ok",
-                "n_rows": int(standardized.shape[0]),
+                "input_format": input_format,
+                "n_raw_rows": int(raw.shape[0]) if isinstance(raw, pd.DataFrame) else 0,
+                "n_analysis_rows": int(standardized.shape[0]),
                 "n_subjects": int(standardized["subject_id"].nunique()),
                 "n_features": int(standardized["feature"].nunique()),
                 "grid_min": float(standardized["grid_pct"].min()) if len(standardized) else np.nan,
                 "grid_max": float(standardized["grid_pct"].max()) if len(standardized) else np.nan,
+                "cycle_qc_ok": int((cycle_qc.get("status", pd.Series(dtype=str)) == "ok").sum()) if isinstance(cycle_qc, pd.DataFrame) and not cycle_qc.empty else np.nan,
                 "message": "",
             })
         except Exception as e:
@@ -734,7 +922,135 @@ def bootstrap_mean_ci(arr: np.ndarray, n_boot: int = 400, seed: int = 42) -> Tup
     return mean, lo, hi
 
 
-def plot_fda_group_mean(mat: pd.DataFrame, meta: pd.DataFrame, subject_col: str, group_col: str, groups_to_plot: Sequence[str], title: str, stance_pct: float, show_significance: bool = True, alpha: float = 0.05) -> plt.Figure:
+
+def fda_grid_tests_all_features(
+    matrices: Dict[str, pd.DataFrame],
+    meta: pd.DataFrame,
+    subject_col: str,
+    group_col: str,
+    control_label: str,
+    disease_label: str,
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """feature-grid별 그룹 차이 Welch t-test와 FDR q-value를 계산한다."""
+    rows: List[dict] = []
+    if not matrices:
+        return pd.DataFrame()
+    meta2 = meta.copy()
+    meta2[subject_col] = meta2[subject_col].astype(str).str.strip()
+    meta2[group_col] = meta2[group_col].astype(str).str.strip()
+    meta2 = meta2.set_index(subject_col)
+
+    for feat, mat in matrices.items():
+        mat2 = mat.copy()
+        mat2.index = mat2.index.astype(str).str.strip()
+        common = [sid for sid in mat2.index if sid in meta2.index]
+        if not common:
+            continue
+        mat2 = mat2.loc[common]
+        s0 = [sid for sid in common if str(meta2.loc[sid, group_col]) == str(control_label)]
+        s1 = [sid for sid in common if str(meta2.loc[sid, group_col]) == str(disease_label)]
+        if len(s0) < 2 or len(s1) < 2:
+            continue
+        feat_rows = []
+        for col in mat2.columns:
+            a = pd.to_numeric(mat2.loc[s0, col], errors="coerce").dropna().to_numpy(dtype=float)
+            b = pd.to_numeric(mat2.loc[s1, col], errors="coerce").dropna().to_numpy(dtype=float)
+            if len(a) < 2 or len(b) < 2:
+                p = np.nan
+                t_stat = np.nan
+            else:
+                try:
+                    test = stats.ttest_ind(a, b, nan_policy="omit", equal_var=False)
+                    t_stat = float(test.statistic)
+                    p = float(test.pvalue)
+                except Exception:
+                    t_stat = np.nan
+                    p = np.nan
+            feat_rows.append({
+                "feature": feat,
+                "grid_pct": float(col),
+                "n_control": int(len(a)),
+                "n_disease": int(len(b)),
+                "control_mean": float(np.nanmean(a)) if len(a) else np.nan,
+                "disease_mean": float(np.nanmean(b)) if len(b) else np.nan,
+                "mean_diff_disease_minus_control": (float(np.nanmean(b)) - float(np.nanmean(a))) if len(a) and len(b) else np.nan,
+                "t_stat": t_stat,
+                "p_value": p,
+            })
+        feat_df = pd.DataFrame(feat_rows)
+        if not feat_df.empty:
+            ok = feat_df["p_value"].notna()
+            feat_df["q_value_fdr"] = np.nan
+            if ok.sum() > 0:
+                _, q = fdrcorrection(feat_df.loc[ok, "p_value"].to_numpy())
+                feat_df.loc[ok, "q_value_fdr"] = q
+            feat_df["significant"] = feat_df["q_value_fdr"] < float(alpha)
+            rows.append(feat_df)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def build_fda_significance_intervals(fda_grid_tests: pd.DataFrame) -> pd.DataFrame:
+    """grid 단위 significant 결과를 feature별 연속 유의구간으로 압축한다."""
+    if fda_grid_tests is None or fda_grid_tests.empty or "significant" not in fda_grid_tests.columns:
+        return pd.DataFrame()
+    rows: List[dict] = []
+    for feat, sub in fda_grid_tests.sort_values(["feature", "grid_pct"]).groupby("feature"):
+        sig = sub[sub["significant"].fillna(False)].copy()
+        if sig.empty:
+            continue
+        grids = sig["grid_pct"].to_numpy(dtype=float)
+        # grid 간격 추정. 기본 1%.
+        all_grids = sub["grid_pct"].to_numpy(dtype=float)
+        diffs = np.diff(np.sort(np.unique(all_grids)))
+        step = float(np.nanmedian(diffs)) if len(diffs) else 1.0
+        start = grids[0]
+        prev = grids[0]
+        idxs = [sig.index[0]]
+        for g, idx in zip(grids[1:], sig.index[1:]):
+            if g - prev <= step * 1.5:
+                prev = g
+                idxs.append(idx)
+            else:
+                ss = sub.loc[idxs]
+                rows.append({
+                    "feature": feat,
+                    "start_grid_pct": float(start),
+                    "end_grid_pct": float(prev),
+                    "n_grid_points": int(len(idxs)),
+                    "min_p_value": float(ss["p_value"].min()),
+                    "min_q_value_fdr": float(ss["q_value_fdr"].min()),
+                    "mean_diff_disease_minus_control": float(ss["mean_diff_disease_minus_control"].mean()),
+                })
+                start = g
+                prev = g
+                idxs = [idx]
+        ss = sub.loc[idxs]
+        rows.append({
+            "feature": feat,
+            "start_grid_pct": float(start),
+            "end_grid_pct": float(prev),
+            "n_grid_points": int(len(idxs)),
+            "min_p_value": float(ss["p_value"].min()),
+            "min_q_value_fdr": float(ss["q_value_fdr"].min()),
+            "mean_diff_disease_minus_control": float(ss["mean_diff_disease_minus_control"].mean()),
+        })
+    return pd.DataFrame(rows).sort_values(["feature", "start_grid_pct"]).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+def plot_fda_group_mean(
+    mat: pd.DataFrame,
+    meta: pd.DataFrame,
+    subject_col: str,
+    group_col: str,
+    groups_to_plot: Sequence[str],
+    title: str,
+    stance_pct: float,
+    show_significance: bool = True,
+    alpha: float = 0.05,
+    sig_table: Optional[pd.DataFrame] = None,
+    feature: Optional[str] = None,
+) -> plt.Figure:
     meta2 = meta.copy()
     meta2[subject_col] = meta2[subject_col].astype(str)
     meta2 = meta2.set_index(subject_col)
@@ -744,6 +1060,15 @@ def plot_fda_group_mean(mat: pd.DataFrame, meta: pd.DataFrame, subject_col: str,
     mat2 = mat2.loc[common]
     grid = mat2.columns.astype(float).to_numpy()
     fig, ax = plt.subplots(figsize=(10.5, 5.2))
+
+    # 유의 구간을 노란색 배경으로 먼저 표시한다.
+    if show_significance and sig_table is not None and not sig_table.empty and feature is not None:
+        feat_sig_table = sig_table[sig_table["feature"].astype(str) == str(feature)].copy()
+        if not feat_sig_table.empty and feat_sig_table.get("significant", pd.Series(dtype=bool)).fillna(False).any():
+            intervals = build_fda_significance_intervals(feat_sig_table)
+            for _, r in intervals.iterrows():
+                ax.axvspan(float(r["start_grid_pct"]), float(r["end_grid_pct"]), color="yellow", alpha=0.28, linewidth=0)
+
     for g in groups_to_plot:
         sids = [sid for sid in common if str(meta2.loc[sid, group_col]) == str(g)]
         if not sids:
@@ -754,23 +1079,7 @@ def plot_fda_group_mean(mat: pd.DataFrame, meta: pd.DataFrame, subject_col: str,
             continue
         ax.plot(grid, mean, label=f"{g} (n={len(sids)})")
         ax.fill_between(grid, lo, hi, alpha=0.16)
-    if show_significance and len(groups_to_plot) == 2:
-        g0, g1 = groups_to_plot
-        s0 = [sid for sid in common if str(meta2.loc[sid, group_col]) == str(g0)]
-        s1 = [sid for sid in common if str(meta2.loc[sid, group_col]) == str(g1)]
-        if len(s0) >= 3 and len(s1) >= 3:
-            pvals = []
-            for col in mat2.columns:
-                pvals.append(stats.ttest_ind(mat2.loc[s0, col], mat2.loc[s1, col], nan_policy="omit", equal_var=False).pvalue)
-            pvals = np.asarray(pvals, dtype=float)
-            ok = np.isfinite(pvals)
-            sig = np.zeros_like(pvals, dtype=bool)
-            if ok.sum():
-                _, q = fdrcorrection(pvals[ok])
-                sig[np.where(ok)[0]] = q < alpha
-            if sig.any():
-                ymin, ymax = ax.get_ylim()
-                ax.scatter(grid[sig], np.full(sig.sum(), ymin + 0.04 * (ymax - ymin)), s=10, marker="|", label=f"FDR q<{alpha}")
+
     ax.axvline(stance_pct, linestyle="--", linewidth=1, alpha=0.55)
     ax.text(stance_pct, ax.get_ylim()[1], " stance/swing", va="top", fontsize=9)
     ax.set_xlabel("Gait cycle (%)")
@@ -842,79 +1151,40 @@ def plot_loading(loadings_long: pd.DataFrame, feature: str, stance_pct: float) -
     return fig
 
 
-def plot_fpca_box(
-    scores_long: pd.DataFrame,
-    meta: pd.DataFrame,
-    subject_col: str,
-    group_col: str,
-    feature: str,
-    pc: str,
-    groups: Sequence[str],
-) -> plt.Figure:
-    sub = scores_long[scores_long["feature"].astype(str) == str(feature)].copy()
 
+def plot_fpca_box(scores_long: pd.DataFrame, meta: pd.DataFrame, subject_col: str, group_col: str, feature: str, pc: str, groups: Sequence[str]) -> plt.Figure:
+    sub = scores_long[scores_long["feature"].astype(str) == str(feature)].copy()
     meta2 = meta[[subject_col, group_col]].copy()
     meta2[subject_col] = meta2[subject_col].astype(str).str.strip()
     meta2[group_col] = meta2[group_col].astype(str).str.strip()
-
     sub["subject_id"] = sub["subject_id"].astype(str).str.strip()
-
-    tmp = sub.merge(
-        meta2,
-        left_on="subject_id",
-        right_on=subject_col,
-        how="left",
-    )
-
+    tmp = sub.merge(meta2, left_on="subject_id", right_on=subject_col, how="left")
     fig, ax = plt.subplots(figsize=(7.4, 4.7))
 
     if pc not in tmp.columns:
-        ax.text(
-            0.5,
-            0.5,
-            f"{pc} 컬럼이 없습니다.",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
+        ax.text(0.5, 0.5, f"{pc} 컬럼이 없습니다.", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         fig.tight_layout()
         return fig
 
     plot_data = []
     plot_labels = []
-
     for g in groups:
-        vals = pd.to_numeric(
-            tmp.loc[tmp[group_col].astype(str) == str(g), pc],
-            errors="coerce",
-        ).dropna().to_numpy(dtype=float)
-
+        vals = pd.to_numeric(tmp.loc[tmp[group_col].astype(str) == str(g), pc], errors="coerce").dropna().to_numpy(dtype=float)
         vals = vals[np.isfinite(vals)]
-
-        # 값이 있는 그룹만 boxplot에 포함
         if len(vals) > 0:
             plot_data.append(vals)
             plot_labels.append(str(g))
 
     if len(plot_data) == 0:
-        ax.text(
-            0.5,
-            0.5,
-            "선택한 feature/PC에서 표시 가능한 그룹 데이터가 없습니다.",
-            ha="center",
-            va="center",
-            transform=ax.transAxes,
-        )
+        ax.text(0.5, 0.5, "선택한 feature/PC에서 표시 가능한 그룹 데이터가 없습니다.", ha="center", va="center", transform=ax.transAxes)
         ax.set_axis_off()
         fig.tight_layout()
         return fig
 
-    # matplotlib 3.9+에서는 labels 대신 tick_labels 권장
     try:
         ax.boxplot(plot_data, tick_labels=plot_labels, showfliers=False)
     except TypeError:
-        # 구버전 matplotlib 호환
         ax.boxplot(plot_data, labels=plot_labels, showfliers=False)
 
     rng = np.random.default_rng(42)
@@ -925,21 +1195,9 @@ def plot_fpca_box(
     ax.set_title(f"{feature} - {pc} 그룹별 분포")
     ax.set_ylabel(f"{pc} score")
     ax.grid(axis="y", alpha=0.25)
-
-    # 그룹 중 하나가 비어 있었으면 그림 안에 알림
     missing_groups = [str(g) for g in groups if str(g) not in plot_labels]
     if missing_groups:
-        ax.text(
-            0.01,
-            0.01,
-            "데이터 없음: " + ", ".join(missing_groups),
-            transform=ax.transAxes,
-            fontsize=9,
-            va="bottom",
-            ha="left",
-            alpha=0.75,
-        )
-
+        ax.text(0.01, 0.01, "데이터 없음: " + ", ".join(missing_groups), transform=ax.transAxes, fontsize=9, va="bottom", ha="left", alpha=0.75)
     fig.tight_layout()
     return fig
 
@@ -1137,7 +1395,7 @@ with st.sidebar:
                 f"{inst} 전처리 gait curve CSV/XLSX/ZIP",
                 type=["csv", "xlsx", "xls", "zip"],
                 key=f"gait_{inst}",
-                help="필수 컬럼: subject_id, feature, grid_pct, value",
+                help="지원: cycle별 MOT wide table(id,side,cycle,t0,t1,time,+MOT 변수) 또는 long table(subject_id,feature,grid_pct,value)",
             )
             crf_files[inst] = st.file_uploader(
                 f"{inst} CRF",
@@ -1145,7 +1403,7 @@ with st.sidebar:
                 key=f"crf_{inst}",
             )
 
-    st.caption("전처리 gait 파일은 환자별 mean gait curve long table이어야 합니다: subject_id, feature, grid_pct, value")
+    st.caption("전처리 gait 파일은 cycle별 MOT wide table(id, side, cycle, t0, t1, time, +원본 MOT 변수) 또는 subject mean long table(subject_id, feature, grid_pct, value)을 지원합니다.")
 
     st.divider()
     st.header("2) 분석 파라미터")
@@ -1258,6 +1516,8 @@ if analyze_clicked:
             adjusted = adjust_all_feature_matrices(matrices_raw, crf_work, subject_col, covariates)
             scores_long, loadings_long, evr, scores_wide = run_fpca_all_features(adjusted, n_components=n_components)
             tests_2d = fpca_2d_tests(scores_long, crf_work, subject_col, group_col, control_label, disease_label, n_perm=n_perm)
+            fda_grid_tests = fda_grid_tests_all_features(adjusted, crf_work, subject_col, group_col, control_label, disease_label, alpha=alpha)
+            fda_sig_intervals = build_fda_significance_intervals(fda_grid_tests)
             adjusted_long = matrix_to_long(adjusted)
             st.session_state["matrices_raw"] = matrices_raw
             st.session_state["adjusted_matrices"] = adjusted
@@ -1267,24 +1527,32 @@ if analyze_clicked:
             st.session_state["loadings_long"] = loadings_long
             st.session_state["evr"] = evr
             st.session_state["tests_2d"] = tests_2d
+            st.session_state["fda_grid_tests"] = fda_grid_tests
+            st.session_state["fda_sig_intervals"] = fda_sig_intervals
             st.session_state["analysis_config"] = pd.DataFrame([
-                {"n_components": n_components, "n_perm": n_perm, "stance_pct": stance_pct, "alpha": alpha, "control_label": control_label, "disease_label": disease_label, "covariates": ";".join(covariates), "features": ";".join(selected_features)}
+                {"n_components": n_components, "n_perm": n_perm, "stance_pct": stance_pct, "alpha": alpha, "fda_yellow_region_rule": "Welch t-test per grid + feature-wise FDR q < alpha", "control_label": control_label, "disease_label": disease_label, "covariates": ";".join(covariates), "features": ";".join(selected_features)}
             ])
             st.session_state["analyzed"] = True
             st.session_state["analysis_zip"] = None
         st.success("분석 완료")
 
-# tabs
-tab_data, tab_fda, tab_fpca, tab_clinical, tab_ml, tab_download = st.tabs(["데이터/매핑", "FDA", "fPCA", "임상척도", "ML", "다운로드"])
+# 화면 선택: st.tabs는 위젯 변경 시 첫 탭으로 돌아가는 문제가 있어 radio 기반으로 고정한다.
+page = st.radio(
+    "분석 화면",
+    ["데이터/매핑", "FDA", "fPCA", "임상척도", "ML", "다운로드"],
+    horizontal=True,
+    key="analysis_page",
+)
 
-with tab_data:
+if page == "데이터/매핑":
     st.subheader("데이터 구조 확인")
     gait_upload_diag = st.session_state.get("gait_upload_diag", pd.DataFrame())
     if not gait_upload_diag.empty:
         st.write("기관별 전처리 gait 업로드 진단")
         st.dataframe(gait_upload_diag, use_container_width=True)
-    st.write("전처리 gait 데이터")
-    st.dataframe(raw_long.head(200), use_container_width=True)
+    st.write("전처리 gait 데이터: 앱 내부 분석용 subject-feature-grid long table")
+    st.caption("cycle별 MOT wide table을 올린 경우, 여기에는 원본 MOT 변수명을 feature로 유지한 subject mean curve가 표시됩니다.")
+    st.dataframe(raw_long.head(300), use_container_width=True)
     st.write("CRF")
     st.dataframe(crf_work.head(100), use_container_width=True)
     map_df = pd.DataFrame({"subject_id": sorted(set(raw_long["subject_id"]) | set(crf_work[subject_col].astype(str)))})
@@ -1296,6 +1564,12 @@ with tab_data:
     group_summary = crf_work[crf_work[subject_col].astype(str).isin(matched_subjects)].groupby(group_col).size().reset_index(name="n")
     st.write("매칭 subject 기준 그룹 분포")
     st.dataframe(group_summary, use_container_width=True)
+else:
+    map_df = pd.DataFrame({"subject_id": sorted(set(raw_long["subject_id"]) | set(crf_work[subject_col].astype(str)))})
+    map_df["in_gait"] = map_df["subject_id"].isin(set(raw_long["subject_id"]))
+    map_df["in_crf"] = map_df["subject_id"].isin(set(crf_work[subject_col].astype(str)))
+    map_df["matched"] = map_df["in_gait"] & map_df["in_crf"]
+    group_summary = crf_work[crf_work[subject_col].astype(str).isin(matched_subjects)].groupby(group_col).size().reset_index(name="n")
 
 if not st.session_state.get("analyzed"):
     st.warning("사이드바에서 파라미터를 정한 뒤 `② 분석 시작`을 눌러주세요.")
@@ -1309,17 +1583,51 @@ scores_wide: pd.DataFrame = st.session_state["scores_wide"]
 loadings_long: pd.DataFrame = st.session_state["loadings_long"]
 evr: pd.DataFrame = st.session_state["evr"]
 tests_2d: pd.DataFrame = st.session_state["tests_2d"]
+fda_grid_tests: pd.DataFrame = st.session_state.get("fda_grid_tests", pd.DataFrame())
+fda_sig_intervals: pd.DataFrame = st.session_state.get("fda_sig_intervals", pd.DataFrame())
 
-with tab_fda:
-    st.subheader("FDA mean curve")
+if page == "FDA":
+    st.subheader("FDA mean curve: 전체 feature")
+    st.caption("노란색 영역은 grid별 Welch t-test 후 feature별 FDR q-value가 α 미만인 구간입니다.")
     if not adjusted:
         st.error("보정 curve가 없습니다.")
     else:
-        feat = st.selectbox("FDA feature 선택", sorted(adjusted.keys()), key="fda_feat")
-        fig = plot_fda_group_mean(adjusted[feat], crf_work, subject_col, group_col, [control_label, disease_label], f"{feat}: {control_label} vs {disease_label}", stance_pct=stance_pct, show_significance=True, alpha=alpha)
-        st.pyplot(fig)
+        st.write("유의구간 요약 테이블")
+        if fda_sig_intervals.empty:
+            st.info("FDR 기준 유의한 연속 구간이 없습니다.")
+        else:
+            st.dataframe(fda_sig_intervals, use_container_width=True)
 
-with tab_fpca:
+        st.write("Grid별 FDA 검정 테이블")
+        if fda_grid_tests.empty:
+            st.info("grid별 검정 결과가 없습니다. 그룹별 표본 수를 확인하세요.")
+        else:
+            st.dataframe(fda_grid_tests, use_container_width=True)
+
+        st.divider()
+        st.write("전체 FDA 그래프")
+        for feat in sorted(adjusted.keys()):
+            st.markdown(f"### {feat}")
+            fig = plot_fda_group_mean(
+                adjusted[feat],
+                crf_work,
+                subject_col,
+                group_col,
+                [control_label, disease_label],
+                f"{feat}: {control_label} vs {disease_label}",
+                stance_pct=stance_pct,
+                show_significance=True,
+                alpha=alpha,
+                sig_table=fda_grid_tests,
+                feature=feat,
+            )
+            st.pyplot(fig)
+            plt.close(fig)
+            feat_intervals = fda_sig_intervals[fda_sig_intervals["feature"].astype(str).eq(str(feat))] if not fda_sig_intervals.empty else pd.DataFrame()
+            if not feat_intervals.empty:
+                st.dataframe(feat_intervals, use_container_width=True)
+
+elif page == "fPCA":
     st.subheader("fPCA 결과")
     if tests_2d.empty:
         st.info("2D 분포 검정 결과가 없습니다. 표본 수 또는 FPC 개수를 확인하세요.")
@@ -1333,19 +1641,22 @@ with tab_fpca:
         with col1:
             fig = plot_fpca_scatter(scores_long, crf_work, subject_col, group_col, feat2, [control_label, disease_label], f"{feat2}: FPC1-FPC2")
             st.pyplot(fig)
+            plt.close(fig)
         with col2:
             fig = plot_loading(loadings_long, feat2, stance_pct=stance_pct)
             st.pyplot(fig)
+            plt.close(fig)
         pc_cols = [c for c in scores_long.columns if c.startswith("FPC")]
         if pc_cols:
             pc = st.selectbox("Boxplot PC", pc_cols)
             fig = plot_fpca_box(scores_long, crf_work, subject_col, group_col, feat2, pc, [control_label, disease_label])
             st.pyplot(fig)
+            plt.close(fig)
     if not evr.empty:
         st.write("설명분산")
         st.dataframe(evr, use_container_width=True)
 
-with tab_clinical:
+elif page == "임상척도":
     st.subheader("질환군 내 임상척도 연결")
     disease_mask = crf_work[group_col].astype(str).eq(str(disease_label))
     numeric_candidates = []
@@ -1366,7 +1677,7 @@ with tab_clinical:
     else:
         st.info("질환군 내에서 UPDRS/HY 등 임상척도를 선택하고 실행하세요.")
 
-with tab_ml:
+elif page == "ML":
     st.subheader("fPCA 기반 leakage-free 로지스틱 회귀")
     st.caption("각 fold 내부에서 공변량 보정과 PCA를 fit하고 test fold는 transform만 수행합니다.")
     ml_features = st.multiselect("ML feature", sorted(matrices_raw.keys()), default=sorted(matrices_raw.keys())[: min(20, len(matrices_raw))])
@@ -1401,10 +1712,11 @@ with tab_ml:
             ax.grid(alpha=0.25)
             fig.tight_layout()
             st.pyplot(fig)
+            plt.close(fig)
         st.write("계수 요약")
         st.dataframe(st.session_state["ml_coef"], use_container_width=True)
 
-with tab_download:
+elif page == "다운로드":
     st.subheader("전체 분석 자료 다운로드")
     include_figures = st.checkbox("주요 PNG 그래프 포함", value=True)
     if st.button("전체 분석 ZIP 생성/갱신"):
@@ -1415,6 +1727,8 @@ with tab_download:
             "00_input/subject_mapping.csv": map_df,
             "00_input/group_summary.csv": group_summary,
             "01_analysis/adjusted_curves_long.csv": adjusted_long,
+            "01_analysis/fda_grid_tests.csv": fda_grid_tests,
+            "01_analysis/fda_significant_intervals.csv": fda_sig_intervals,
             "02_fpca/fpca_scores_long.csv": scores_long,
             "02_fpca/fpca_scores_wide.csv": scores_wide,
             "02_fpca/fpca_loadings_long.csv": loadings_long,
@@ -1431,10 +1745,14 @@ with tab_download:
             files["04_ml/ml_logistic_coefficients.csv"] = st.session_state["ml_coef"]
         extra = {}
         if include_figures and adjusted:
-            top_feats = sorted(list(adjusted.keys()))[: min(10, len(adjusted))]
-            for feat in top_feats:
+            for feat in sorted(list(adjusted.keys())):
                 try:
-                    fig = plot_fda_group_mean(adjusted[feat], crf_work, subject_col, group_col, [control_label, disease_label], f"{feat}: FDA", stance_pct=stance_pct, show_significance=True, alpha=alpha)
+                    fig = plot_fda_group_mean(
+                        adjusted[feat], crf_work, subject_col, group_col,
+                        [control_label, disease_label], f"{feat}: FDA",
+                        stance_pct=stance_pct, show_significance=True, alpha=alpha,
+                        sig_table=fda_grid_tests, feature=feat,
+                    )
                     extra[f"figures/fda_{safe_filename(feat)}.png"] = fig_to_png_bytes(fig)
                 except Exception:
                     pass
@@ -1461,4 +1779,4 @@ with tab_download:
         )
 
 st.divider()
-st.caption("주의: 이 앱은 원본 MOT/TRC 전처리를 수행하지 않습니다. 입력 gait 데이터는 환자별 mean curve가 생성된 전처리 결과여야 합니다.")
+st.caption("주의: 이 앱은 원본 MOT/TRC 전처리를 수행하지 않습니다. 입력 gait 데이터는 cycle별 MOT wide table 또는 subject-level mean curve long table이어야 합니다.")

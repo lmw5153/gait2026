@@ -1,65 +1,27 @@
-# OpenCap Gait 분석 웹서비스 - 2~5번 분석 전용
+# OpenCap Gait Analysis App
 
-이 저장소의 `app.py`는 **분석 전용 Streamlit 앱**입니다. 원본 MOT/TRC 전처리(1번 작업)는 이 웹앱에서 수행하지 않습니다.
+이 앱은 1단계 전처리 산출물을 받아 2~5번 분석(FDA/fPCA/임상척도/ML)을 수행하는 Streamlit 앱입니다.
 
-## 전체 작업 분리
+## 지원 입력
 
-```text
-1번 작업: 로컬/서버 전처리
-- 원본 MOT/TRC 수집
-- 6m walking trial 선별
-- 결측 보정
-- spline smoothing
-- 0~100% gait cycle 정규화
-- 환자 내 이상 trajectory 제외
-- 환자별 feature mean curve 생성
-- preprocessed_gait_curves_long.csv 생성
-
-2~5번 작업: 웹앱 분석
-- CRF와 전처리 gait curve 매핑
-- FDA/fPCA 분석
-- 질환군 내 HY/UPDRS 임상척도 연결
-- leakage-free ML 분석
-- 전체 결과 ZIP 다운로드
-```
-
-## 웹앱 입력자료
-
-웹앱에는 원본 `.mot`, `.trc` 파일을 올리지 않습니다.
-
-기관별로 다음 파일을 업로드합니다.
+### 1) cycle별 MOT wide table
+샘플 형식:
 
 ```text
-UNI 전처리 gait curve CSV/XLSX/ZIP + UNI CRF
-UUH 전처리 gait curve CSV/XLSX/ZIP + UUH CRF
-JBH 전처리 gait curve CSV/XLSX/ZIP + JBH CRF
+id, side, cycle, t0, t1, to, to_pct, phase, time, pelvis_tilt, ..., hip_flexion_r, ...
 ```
 
-전처리 gait curve 파일의 필수 컬럼은 다음 4개입니다.
+앱 내부에서 `id` 예: `UUH1_6m_1`에서 `UUH1`을 subject_id로 추출하고, cycle별 time을 0~100% grid로 정규화한 뒤 원본 MOT 변수명을 그대로 feature로 유지하여 subject-level mean curve를 만듭니다.
+
+### 2) subject mean long table
 
 ```text
 subject_id, feature, grid_pct, value
 ```
 
-예시:
+## FDA
 
-```csv
-subject_id,feature,grid_pct,value,n_trials_total,n_trials_kept
-UNI1,hip_flexion_r,0,10.23,3,3
-UNI1,hip_flexion_r,1,10.45,3,3
-UNI2,hip_flexion_r,0,8.91,2,2
-```
-
-## 그룹 분리
-
-기관명으로 정상군/질환군을 나누지 않습니다. CRF의 `피험자군` 컬럼을 기본 그룹 컬럼으로 사용합니다.
-
-예:
-
-```text
-피험자군 = Control
-피험자군 = Parkinson
-```
+FDA 화면은 선택형이 아니라 전체 feature를 표시합니다. 그룹 간 grid별 Welch t-test 후 feature별 FDR q-value가 alpha 미만인 구간을 노란색 영역으로 표시하고, grid별 검정 테이블과 유의구간 테이블을 제공합니다.
 
 ## 실행
 
