@@ -432,9 +432,28 @@ def cycle_wide_to_subject_mean_long(
     qc_df = pd.DataFrame(cycle_qc_rows)
     return subject_mean, qc_df, []
 
-def standardize_gait_input(df: pd.DataFrame, institution: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-    """long-format 또는 cycle-wide-format 전처리 결과를 분석용 subject-level long table로 표준화한다."""
+def standardize_gait_input(
+    df: pd.DataFrame,
+    institution: str,
+    allow_cyclewide_conversion: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """long-format 또는 cycle-wide-format 전처리 결과를 분석용 subject-level long table로 표준화한다.
+
+    권장 경로는 전처리 단계에서 이미 만든 subject mean long table을 올리는 것이다.
+    cycle-wide MOT table을 웹에서 mean curve로 바꾸는 기능은 대용량에서 느리므로 기본 OFF다.
+    """
     if is_cycle_wide_gait_table(df):
+        if not allow_cyclewide_conversion:
+            return (
+                pd.DataFrame(),
+                pd.DataFrame(),
+                [
+                    "업로드 파일이 cycle-level MOT wide table입니다. "
+                    "웹에서 이 파일을 mean curve로 변환하면 느립니다. "
+                    "전처리 단계에서 *_subject_mean_curve_long.csv 또는 *_subject_mean_curve_upload_ready.zip을 만든 뒤 업로드하세요. "
+                    "테스트 목적이면 사이드바의 '웹에서 cycle-level MOT를 mean curve로 변환 허용(느림)' 옵션을 켜세요."
+                ],
+            )
         return cycle_wide_to_subject_mean_long(df, institution=institution)
     long_df, errors = standardize_gait_long(df)
     if errors:
@@ -550,7 +569,7 @@ def merge_crf_files(crf_files: Dict[str, object]) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def merge_preprocessed_gait_files(gait_files: Dict[str, object]) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+def merge_preprocessed_gait_files(gait_files: Dict[str, object], allow_cyclewide_conversion: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """기관별 전처리 gait curve 파일을 읽어 하나의 long table로 합친다.
 
     이 함수는 원본 MOT/TRC를 읽지 않는다. 1단계 로컬 전처리 결과
@@ -566,7 +585,7 @@ def merge_preprocessed_gait_files(gait_files: Dict[str, object]) -> Tuple[pd.Dat
         inst = inst.upper()
         try:
             raw = read_preprocessed_gait_file(f)
-            standardized, cycle_qc, gait_errors = standardize_gait_input(raw, inst)
+            standardized, cycle_qc, gait_errors = standardize_gait_input(raw, inst, allow_cyclewide_conversion=allow_cyclewide_conversion)
             if gait_errors:
                 errors.extend([f"{inst} gait 데이터 오류: {e}" for e in gait_errors])
                 diag_rows.append({
@@ -1421,16 +1440,40 @@ def run_no_leakage_ml(raw_matrices: Dict[str, pd.DataFrame], meta: pd.DataFrame,
 # =============================================================================
 
 st.title("🚶 OpenCap Gait 분석 웹서비스")
-st.caption("2~5번 분석 전용 버전: 1번 원본 MOT/TRC 전처리는 로컬에서 끝내고, 웹에는 전처리된 gait curve + 기관별 CRF만 업로드합니다.")
+st.caption("2~5번 분석 전용 버전: 1번 원본 MOT/TRC 전처리는 로컬에서 끝내고, 웹에는 subject mean curve + 기관별 CRF만 업로드합니다.")
 
-# session init
+# -----------------------------------------------------------------------------
+# Session state
+# -----------------------------------------------------------------------------
 for key, default in {
     "loaded": False,
-    "analyzed": False,
+    "fda_done": False,
+    "fpca_done": False,
+    "clinical_done": False,
+    "ml_done": False,
     "analysis_zip": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+# 이전 버전 호환: analyzed가 남아 있어도 단계형 상태를 우선한다.
+st.session_state["analyzed"] = bool(st.session_state.get("fda_done", False) or st.session_state.get("fpca_done", False))
+
+
+def reset_downstream_steps(from_step: str = "load") -> None:
+    """입력/파라미터 변경 후 하위 분석 결과를 지운다."""
+    order = ["fda", "fpca", "clinical", "ml"]
+    start = 0 if from_step == "load" else order.index(from_step) + 1 if from_step in order else 0
+    for step in order[start:]:
+        st.session_state[f"{step}_done"] = False
+    for k in [
+        "matrices_raw", "adjusted_matrices", "adjusted_long", "fda_grid_tests", "fda_sig_intervals",
+        "scores_long", "scores_wide", "loadings_long", "evr", "tests_2d",
+        "clin_corr", "ml_fold", "ml_oof_metrics", "ml_oof", "ml_coef", "analysis_zip",
+        "analysis_config",
+    ]:
+        st.session_state.pop(k, None)
+
 
 with st.sidebar:
     st.header("입력 자료: 1단계 전처리 산출물 + CRF")
@@ -1441,10 +1484,10 @@ with st.sidebar:
     for inst in INSTITUTIONS:
         with st.expander(f"{inst} 업로드", expanded=(inst in ["UNI", "UUH"])):
             gait_files[inst] = st.file_uploader(
-                f"{inst} 전처리 gait curve CSV/XLSX/ZIP",
+                f"{inst} subject mean curve CSV/XLSX/ZIP",
                 type=["csv", "xlsx", "xls", "zip"],
                 key=f"gait_{inst}",
-                help="지원: cycle별 MOT wide table(id,side,cycle,t0,t1,time,+MOT 변수) 또는 long table(subject_id,feature,grid_pct,value)",
+                help="권장 입력: subject_id, feature, grid_pct, value. cycle-level MOT wide table도 지원하지만 느립니다.",
             )
             crf_files[inst] = st.file_uploader(
                 f"{inst} CRF",
@@ -1452,10 +1495,15 @@ with st.sidebar:
                 key=f"crf_{inst}",
             )
 
-    st.caption("전처리 gait 파일은 cycle별 MOT wide table(id, side, cycle, t0, t1, time, +원본 MOT 변수) 또는 subject mean long table(subject_id, feature, grid_pct, value)을 지원합니다.")
+    st.caption("권장 입력: 전처리 단계에서 만든 subject mean long table(subject_id, feature, grid_pct, value).")
+    allow_cycle_wide_conversion = st.checkbox(
+        "웹에서 cycle-level MOT를 mean curve로 변환 허용(느림)",
+        value=False,
+        help="테스트용입니다. 실제 운영에서는 로컬 전처리에서 subject mean curve를 만든 뒤 업로드하세요.",
+    )
 
     st.divider()
-    st.header("2) 분석 파라미터")
+    st.header("분석 파라미터")
     n_components = st.slider("fPC 개수", 1, 5, 2)
     n_perm = st.slider("2D 분포 검정 permutation", 100, 5000, 1000, step=100)
     stance_pct = st.slider("Stance/Swing 기준점 (%)", 40, 80, 60)
@@ -1469,49 +1517,55 @@ with st.sidebar:
 
 if load_clicked:
     try:
-        gait_long, gait_upload_diag, gait_errors = merge_preprocessed_gait_files(gait_files)
+        gait_long, gait_upload_diag, gait_errors = merge_preprocessed_gait_files(
+            gait_files,
+            allow_cyclewide_conversion=allow_cycle_wide_conversion,
+        )
         crf = merge_crf_files(crf_files)
         if gait_errors:
             st.session_state["loaded"] = False
             st.session_state["gait_upload_diag"] = gait_upload_diag
+            reset_downstream_steps("load")
             for e in gait_errors:
                 st.error(e)
         elif crf.empty:
             st.session_state["loaded"] = False
+            reset_downstream_steps("load")
             st.error("CRF가 비어 있습니다. 최소 1개 기관의 CRF를 업로드하세요.")
         else:
             st.session_state["gait_long"] = gait_long
             st.session_state["gait_upload_diag"] = gait_upload_diag
             st.session_state["crf"] = crf
             st.session_state["loaded"] = True
-            st.session_state["analyzed"] = False
-            st.session_state["analysis_zip"] = None
-            st.success("기관별 전처리 gait 데이터와 CRF 로드/매핑 준비 완료")
+            reset_downstream_steps("load")
+            st.success("기관별 subject mean curve 데이터와 CRF 로드/매핑 완료")
     except Exception as e:
         st.session_state["loaded"] = False
+        reset_downstream_steps("load")
         st.error(f"데이터 로드 실패: {e}")
 
 if not st.session_state.get("loaded"):
-    st.info("기관별 전처리 gait curve 데이터와 기관별 CRF를 업로드한 뒤, 사이드바의 `① 데이터 로드/매핑`을 눌러주세요.")
+    st.info("기관별 subject mean curve 데이터와 기관별 CRF를 업로드한 뒤, 사이드바의 `① 데이터 로드/매핑`을 눌러주세요.")
     with st.expander("전처리 gait 데이터 형식 예시", expanded=True):
         example = pd.DataFrame({
             "subject_id": ["UNI1", "UNI1", "UNI1", "UNI2", "UNI2"],
             "feature": ["hip_flexion_r", "hip_flexion_r", "hip_flexion_r", "hip_flexion_r", "hip_flexion_r"],
             "grid_pct": [0, 1, 2, 0, 1],
             "value": [10.2, 10.5, 11.0, 8.9, 9.1],
-            "n_trials_kept": [3, 3, 3, 2, 2],
+            "n_cycles_kept": [22, 22, 22, 18, 18],
         })
         st.dataframe(example, use_container_width=True)
     st.stop()
 
-# loaded data
+# -----------------------------------------------------------------------------
+# Loaded data and common mapping
+# -----------------------------------------------------------------------------
 raw_long: pd.DataFrame = st.session_state["gait_long"]
 crf: pd.DataFrame = st.session_state["crf"]
 
-# Mapping diagnostics
 subject_col_default = "subject_id" if "subject_id" in crf.columns else crf.columns[0]
 with st.sidebar:
-    st.header("3) 컬럼/그룹 설정")
+    st.header("컬럼/그룹 설정")
     subject_col = st.selectbox("CRF subject ID 컬럼", crf.columns.tolist(), index=crf.columns.tolist().index(subject_col_default))
     group_default = "피험자군" if "피험자군" in crf.columns else crf.columns.tolist()[0]
     group_col = st.selectbox("그룹 컬럼", crf.columns.tolist(), index=crf.columns.tolist().index(group_default))
@@ -1531,18 +1585,19 @@ with st.sidebar:
     covariates = st.multiselect("공변량 보정 변수", crf.columns.tolist(), default=candidate_covs)
 
     all_features = sorted(raw_long["feature"].dropna().astype(str).unique().tolist())
-    default_features = all_features
-    selected_features = st.multiselect("분석 feature", all_features, default=default_features)
+    selected_features = st.multiselect("분석 feature", all_features, default=all_features)
 
-    analyze_clicked = st.button("② 분석 시작", type="primary", use_container_width=True)
-
-# Standardize subject col and merge
 crf_work = crf.copy()
 crf_work[subject_col] = crf_work[subject_col].astype(str).str.strip()
 raw_long["subject_id"] = raw_long["subject_id"].astype(str).str.strip()
 matched_subjects = sorted(set(raw_long["subject_id"]) & set(crf_work[subject_col].astype(str)))
 
-# Header metrics
+map_df = pd.DataFrame({"subject_id": sorted(set(raw_long["subject_id"]) | set(crf_work[subject_col].astype(str)))})
+map_df["in_gait"] = map_df["subject_id"].isin(set(raw_long["subject_id"]))
+map_df["in_crf"] = map_df["subject_id"].isin(set(crf_work[subject_col].astype(str)))
+map_df["matched"] = map_df["in_gait"] & map_df["in_crf"]
+group_summary = crf_work[crf_work[subject_col].astype(str).isin(matched_subjects)].groupby(group_col).size().reset_index(name="n")
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Gait subjects", raw_long["subject_id"].nunique())
 c2.metric("CRF subjects", crf_work[subject_col].nunique())
@@ -1553,45 +1608,191 @@ if len(matched_subjects) == 0:
     st.error("gait 데이터 subject_id와 CRF subject ID가 매칭되지 않습니다.")
     st.stop()
 
-if analyze_clicked:
+# -----------------------------------------------------------------------------
+# Sequential analysis controls
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.divider()
+    st.header("순차 분석 실행")
+    st.caption("아래 버튼을 위에서 아래 순서대로 실행하세요.")
+
+    fda_clicked = st.button(
+        "② FDA 실행",
+        type="primary" if not st.session_state.get("fda_done") else "secondary",
+        use_container_width=True,
+        disabled=not st.session_state.get("loaded", False),
+    )
+    fpca_clicked = st.button(
+        "③ fPCA 실행",
+        type="primary" if st.session_state.get("fda_done") and not st.session_state.get("fpca_done") else "secondary",
+        use_container_width=True,
+        disabled=not st.session_state.get("fda_done", False),
+    )
+
+    # clinical variable choices depend on loaded CRF; keep them near the sequential button.
+    numeric_candidates = []
+    for c in crf_work.columns:
+        if c in [subject_col, group_col, "institution"]:
+            continue
+        num = pd.to_numeric(crf_work[c], errors="coerce")
+        if num.notna().sum() >= 5:
+            numeric_candidates.append(c)
+    default_clin = [c for c in ["updrs_auto", "hy_stage_auto"] if c in numeric_candidates]
+    clinical_vars = st.multiselect("임상 상관분석 변수", numeric_candidates, default=default_clin, key="clinical_vars_seq")
+    clinical_clicked = st.button(
+        "④ 임상 분석 실행",
+        type="primary" if st.session_state.get("fpca_done") and not st.session_state.get("clinical_done") else "secondary",
+        use_container_width=True,
+        disabled=not st.session_state.get("fpca_done", False),
+    )
+
+    available_ml_features = sorted(st.session_state.get("matrices_raw", {}).keys()) if st.session_state.get("fda_done") else selected_features
+    default_ml_features = available_ml_features[: min(20, len(available_ml_features))]
+    ml_features = st.multiselect("ML feature", available_ml_features, default=default_ml_features, key="ml_features_seq")
+    ml_clicked = st.button(
+        "⑤ ML 실행",
+        type="primary" if st.session_state.get("clinical_done") and not st.session_state.get("ml_done") else "secondary",
+        use_container_width=True,
+        disabled=not st.session_state.get("clinical_done", False),
+    )
+
+# Step ② FDA: feature matrix + covariate adjustment + FDA grid tests only
+if fda_clicked:
     if not selected_features:
         st.error("분석할 feature를 하나 이상 선택하세요.")
     else:
-        with st.spinner("FDA/fPCA 분석 중..."):
+        with st.spinner("② FDA 준비 및 grid별 검정 실행 중..."):
             long_sel = raw_long[raw_long["feature"].isin(selected_features)].copy()
-            # matched subjects only
             long_sel = long_sel[long_sel["subject_id"].isin(matched_subjects)].copy()
             matrices_raw = long_to_feature_matrices(long_sel)
             adjusted = adjust_all_feature_matrices(matrices_raw, crf_work, subject_col, covariates)
-            scores_long, loadings_long, evr, scores_wide = run_fpca_all_features(adjusted, n_components=n_components)
-            tests_2d = fpca_2d_tests(scores_long, crf_work, subject_col, group_col, control_label, disease_label, n_perm=n_perm)
             fda_grid_tests = fda_grid_tests_all_features(adjusted, crf_work, subject_col, group_col, control_label, disease_label, alpha=alpha)
             fda_sig_intervals = build_fda_significance_intervals(fda_grid_tests)
             adjusted_long = matrix_to_long(adjusted)
+
             st.session_state["matrices_raw"] = matrices_raw
             st.session_state["adjusted_matrices"] = adjusted
             st.session_state["adjusted_long"] = adjusted_long
+            st.session_state["fda_grid_tests"] = fda_grid_tests
+            st.session_state["fda_sig_intervals"] = fda_sig_intervals
+            st.session_state["analysis_config"] = pd.DataFrame([{
+                "n_components": n_components,
+                "n_perm": n_perm,
+                "stance_pct": stance_pct,
+                "alpha": alpha,
+                "fda_yellow_region_rule": "Welch t-test per grid + feature-wise FDR q < alpha",
+                "control_label": control_label,
+                "disease_label": disease_label,
+                "covariates": ";".join(covariates),
+                "features": ";".join(selected_features),
+            }])
+            st.session_state["fda_done"] = True
+            # FDA를 다시 돌리면 하위 결과는 무효화
+            for step in ["fpca", "clinical", "ml"]:
+                st.session_state[f"{step}_done"] = False
+            for k in ["scores_long", "scores_wide", "loadings_long", "evr", "tests_2d", "clin_corr", "ml_fold", "ml_oof_metrics", "ml_oof", "ml_coef", "analysis_zip"]:
+                st.session_state.pop(k, None)
+        st.success("② FDA 완료")
+
+# Step ③ fPCA
+if fpca_clicked:
+    if not st.session_state.get("fda_done"):
+        st.warning("먼저 ② FDA를 실행하세요.")
+    else:
+        with st.spinner("③ fPCA 및 2D 분포 검정 실행 중..."):
+            adjusted = st.session_state.get("adjusted_matrices", {})
+            scores_long, loadings_long, evr, scores_wide = run_fpca_all_features(adjusted, n_components=n_components)
+            tests_2d = fpca_2d_tests(scores_long, crf_work, subject_col, group_col, control_label, disease_label, n_perm=n_perm)
             st.session_state["scores_long"] = scores_long
             st.session_state["scores_wide"] = scores_wide
             st.session_state["loadings_long"] = loadings_long
             st.session_state["evr"] = evr
             st.session_state["tests_2d"] = tests_2d
-            st.session_state["fda_grid_tests"] = fda_grid_tests
-            st.session_state["fda_sig_intervals"] = fda_sig_intervals
-            st.session_state["analysis_config"] = pd.DataFrame([
-                {"n_components": n_components, "n_perm": n_perm, "stance_pct": stance_pct, "alpha": alpha, "fda_yellow_region_rule": "Welch t-test per grid + feature-wise FDR q < alpha", "control_label": control_label, "disease_label": disease_label, "covariates": ";".join(covariates), "features": ";".join(selected_features)}
-            ])
-            st.session_state["analyzed"] = True
-            st.session_state["analysis_zip"] = None
-        st.success("분석 완료")
+            st.session_state["fpca_done"] = True
+            for step in ["clinical", "ml"]:
+                st.session_state[f"{step}_done"] = False
+            for k in ["clin_corr", "ml_fold", "ml_oof_metrics", "ml_oof", "ml_coef", "analysis_zip"]:
+                st.session_state.pop(k, None)
+        st.success("③ fPCA 완료")
 
-# 화면 선택: st.tabs는 위젯 변경 시 첫 탭으로 돌아가는 문제가 있어 radio 기반으로 고정한다.
-page = st.radio(
-    "분석 화면",
-    ["데이터/매핑", "FDA", "fPCA", "임상척도", "ML", "다운로드"],
-    horizontal=True,
-    key="analysis_page",
-)
+# Step ④ Clinical
+if clinical_clicked:
+    if not st.session_state.get("fpca_done"):
+        st.warning("먼저 ③ fPCA를 실행하세요.")
+    else:
+        with st.spinner("④ 임상척도 상관분석 실행 중..."):
+            scores_wide = st.session_state.get("scores_wide", pd.DataFrame())
+            disease_mask = crf_work[group_col].astype(str).eq(str(disease_label))
+            clin_corr = fpca_clinical_correlation(scores_wide, crf_work, subject_col, disease_mask, clinical_vars)
+            st.session_state["clin_corr"] = clin_corr
+            st.session_state["clinical_done"] = True
+            st.session_state["ml_done"] = False
+            for k in ["ml_fold", "ml_oof_metrics", "ml_oof", "ml_coef", "analysis_zip"]:
+                st.session_state.pop(k, None)
+        st.success("④ 임상 분석 완료")
+
+# Step ⑤ ML
+if ml_clicked:
+    if not st.session_state.get("clinical_done"):
+        st.warning("먼저 ④ 임상 분석을 실행하세요.")
+    elif not ml_features:
+        st.error("ML feature를 하나 이상 선택하세요.")
+    else:
+        try:
+            with st.spinner("⑤ ML 교차검증 실행 중..."):
+                matrices_raw = st.session_state.get("matrices_raw", {})
+                fold_df, oof_metrics, oof_df, coef_df = run_no_leakage_ml(
+                    matrices_raw,
+                    crf_work,
+                    subject_col,
+                    group_col,
+                    control_label,
+                    disease_label,
+                    covariates,
+                    ml_features,
+                    n_components,
+                    n_splits,
+                    c_value,
+                    int(random_state),
+                )
+                st.session_state["ml_fold"] = fold_df
+                st.session_state["ml_oof_metrics"] = oof_metrics
+                st.session_state["ml_oof"] = oof_df
+                st.session_state["ml_coef"] = coef_df
+                st.session_state["ml_done"] = True
+                st.session_state.pop("analysis_zip", None)
+            st.success("⑤ ML 완료")
+        except Exception as e:
+            st.error(f"ML 실패: {e}")
+
+# -----------------------------------------------------------------------------
+# Status and page navigation
+# -----------------------------------------------------------------------------
+status_cols = st.columns(5)
+steps = [
+    ("① 데이터", st.session_state.get("loaded", False)),
+    ("② FDA", st.session_state.get("fda_done", False)),
+    ("③ fPCA", st.session_state.get("fpca_done", False)),
+    ("④ 임상", st.session_state.get("clinical_done", False)),
+    ("⑤ ML", st.session_state.get("ml_done", False)),
+]
+for col, (label, done) in zip(status_cols, steps):
+    col.metric(label, "완료" if done else "대기")
+
+page_options = ["데이터/매핑", "FDA", "fPCA", "임상척도", "ML", "다운로드"]
+page = st.radio("분석 화면", page_options, horizontal=True, key="analysis_page")
+
+# Common result handles; may be empty if corresponding step not run.
+matrices_raw: Dict[str, pd.DataFrame] = st.session_state.get("matrices_raw", {})
+adjusted: Dict[str, pd.DataFrame] = st.session_state.get("adjusted_matrices", {})
+adjusted_long: pd.DataFrame = st.session_state.get("adjusted_long", pd.DataFrame())
+fda_grid_tests: pd.DataFrame = st.session_state.get("fda_grid_tests", pd.DataFrame())
+fda_sig_intervals: pd.DataFrame = st.session_state.get("fda_sig_intervals", pd.DataFrame())
+scores_long: pd.DataFrame = st.session_state.get("scores_long", pd.DataFrame())
+scores_wide: pd.DataFrame = st.session_state.get("scores_wide", pd.DataFrame())
+loadings_long: pd.DataFrame = st.session_state.get("loadings_long", pd.DataFrame())
+evr: pd.DataFrame = st.session_state.get("evr", pd.DataFrame())
+tests_2d: pd.DataFrame = st.session_state.get("tests_2d", pd.DataFrame())
 
 if page == "데이터/매핑":
     st.subheader("데이터 구조 확인")
@@ -1599,60 +1800,33 @@ if page == "데이터/매핑":
     if not gait_upload_diag.empty:
         st.write("기관별 전처리 gait 업로드 진단")
         st.dataframe(gait_upload_diag, use_container_width=True)
-    st.write("전처리 gait 데이터: 앱 내부 분석용 subject-feature-grid long table")
-    st.caption("cycle별 MOT wide table을 올린 경우, 여기에는 원본 MOT 변수명을 feature로 유지한 subject mean curve가 표시됩니다.")
+    st.write("전처리 gait 데이터: subject mean curve long table")
     st.dataframe(raw_long.head(300), use_container_width=True)
     st.write("CRF")
     st.dataframe(crf_work.head(100), use_container_width=True)
-    map_df = pd.DataFrame({"subject_id": sorted(set(raw_long["subject_id"]) | set(crf_work[subject_col].astype(str)))})
-    map_df["in_gait"] = map_df["subject_id"].isin(set(raw_long["subject_id"]))
-    map_df["in_crf"] = map_df["subject_id"].isin(set(crf_work[subject_col].astype(str)))
-    map_df["matched"] = map_df["in_gait"] & map_df["in_crf"]
     st.write("Subject 매핑 진단")
     st.dataframe(map_df, use_container_width=True)
-    group_summary = crf_work[crf_work[subject_col].astype(str).isin(matched_subjects)].groupby(group_col).size().reset_index(name="n")
     st.write("매칭 subject 기준 그룹 분포")
     st.dataframe(group_summary, use_container_width=True)
-else:
-    map_df = pd.DataFrame({"subject_id": sorted(set(raw_long["subject_id"]) | set(crf_work[subject_col].astype(str)))})
-    map_df["in_gait"] = map_df["subject_id"].isin(set(raw_long["subject_id"]))
-    map_df["in_crf"] = map_df["subject_id"].isin(set(crf_work[subject_col].astype(str)))
-    map_df["matched"] = map_df["in_gait"] & map_df["in_crf"]
-    group_summary = crf_work[crf_work[subject_col].astype(str).isin(matched_subjects)].groupby(group_col).size().reset_index(name="n")
 
-if not st.session_state.get("analyzed"):
-    st.warning("사이드바에서 파라미터를 정한 뒤 `② 분석 시작`을 눌러주세요.")
-    st.stop()
-
-matrices_raw: Dict[str, pd.DataFrame] = st.session_state["matrices_raw"]
-adjusted: Dict[str, pd.DataFrame] = st.session_state["adjusted_matrices"]
-adjusted_long: pd.DataFrame = st.session_state["adjusted_long"]
-scores_long: pd.DataFrame = st.session_state["scores_long"]
-scores_wide: pd.DataFrame = st.session_state["scores_wide"]
-loadings_long: pd.DataFrame = st.session_state["loadings_long"]
-evr: pd.DataFrame = st.session_state["evr"]
-tests_2d: pd.DataFrame = st.session_state["tests_2d"]
-fda_grid_tests: pd.DataFrame = st.session_state.get("fda_grid_tests", pd.DataFrame())
-fda_sig_intervals: pd.DataFrame = st.session_state.get("fda_sig_intervals", pd.DataFrame())
-
-if page == "FDA":
+elif page == "FDA":
     st.subheader("FDA mean curve")
-    st.caption("분석은 전체 선택 feature에 대해 수행하고, 화면에는 선택한 feature만 표시합니다. 전체 grid별 검정과 유의구간은 다운로드 ZIP의 CSV로 제공합니다. 노란색 영역은 grid별 Welch t-test 후 feature별 FDR q-value가 α 미만인 구간입니다.")
-    if not adjusted:
+    if not st.session_state.get("fda_done"):
+        st.warning("사이드바에서 `② FDA 실행`을 먼저 누르세요.")
+    elif not adjusted:
         st.error("보정 curve가 없습니다.")
     else:
+        st.caption("FDA는 전체 선택 feature에 대해 계산되며, 화면에서는 feature 하나씩 확인합니다. 노란색 영역은 grid별 Welch t-test 후 feature별 FDR q-value가 α 미만인 구간입니다.")
         st.write("유의구간 요약 테이블")
         if fda_sig_intervals.empty:
             st.info("FDR 기준 유의한 연속 구간이 없습니다.")
         else:
             st.dataframe(fda_sig_intervals, use_container_width=True)
-
         with st.expander("Grid별 FDA 검정 테이블 보기", expanded=False):
             if fda_grid_tests.empty:
                 st.info("grid별 검정 결과가 없습니다. 그룹별 표본 수를 확인하세요.")
             else:
                 st.dataframe(fda_grid_tests, use_container_width=True)
-
         st.divider()
         available_fda_features = sorted(adjusted.keys())
         if not fda_sig_intervals.empty:
@@ -1681,69 +1855,52 @@ if page == "FDA":
 
 elif page == "fPCA":
     st.subheader("fPCA 결과")
-    if tests_2d.empty:
-        st.info("2D 분포 검정 결과가 없습니다. 표본 수 또는 FPC 개수를 확인하세요.")
+    if not st.session_state.get("fpca_done"):
+        st.warning("사이드바에서 `③ fPCA 실행`을 먼저 누르세요. `③ fPCA 실행`은 `② FDA 실행` 후 활성화됩니다.")
     else:
-        st.write("FPC1-FPC2 그룹 분포 차이 검정")
-        st.dataframe(tests_2d, use_container_width=True)
-    if not scores_long.empty:
-        feat_options = sorted(scores_long["feature"].unique().tolist())
-        feat2 = st.selectbox("fPCA feature 선택", feat_options, key="fpca_feat")
-        col1, col2 = st.columns(2)
-        with col1:
-            fig = plot_fpca_scatter(scores_long, crf_work, subject_col, group_col, feat2, [control_label, disease_label], f"{feat2}: FPC1-FPC2")
-            st.pyplot(fig)
-            plt.close(fig)
-        with col2:
-            fig = plot_loading(loadings_long, feat2, stance_pct=stance_pct)
-            st.pyplot(fig)
-            plt.close(fig)
-        pc_cols = [c for c in scores_long.columns if c.startswith("FPC")]
-        if pc_cols:
-            pc = st.selectbox("Boxplot PC", pc_cols)
-            fig = plot_fpca_box(scores_long, crf_work, subject_col, group_col, feat2, pc, [control_label, disease_label])
-            st.pyplot(fig)
-            plt.close(fig)
-    if not evr.empty:
-        st.write("설명분산")
-        st.dataframe(evr, use_container_width=True)
+        if tests_2d.empty:
+            st.info("2D 분포 검정 결과가 없습니다. 표본 수 또는 FPC 개수를 확인하세요.")
+        else:
+            st.write("FPC1-FPC2 그룹 분포 차이 검정")
+            st.dataframe(tests_2d, use_container_width=True)
+        if not scores_long.empty:
+            feat_options = sorted(scores_long["feature"].unique().tolist())
+            feat2 = st.selectbox("fPCA feature 선택", feat_options, key="fpca_feat")
+            col1, col2 = st.columns(2)
+            with col1:
+                fig = plot_fpca_scatter(scores_long, crf_work, subject_col, group_col, feat2, [control_label, disease_label], f"{feat2}: FPC1-FPC2")
+                st.pyplot(fig)
+                plt.close(fig)
+            with col2:
+                fig = plot_loading(loadings_long, feat2, stance_pct=stance_pct)
+                st.pyplot(fig)
+                plt.close(fig)
+            pc_cols = [c for c in scores_long.columns if c.startswith("FPC")]
+            if pc_cols:
+                pc = st.selectbox("Boxplot PC", pc_cols)
+                fig = plot_fpca_box(scores_long, crf_work, subject_col, group_col, feat2, pc, [control_label, disease_label])
+                st.pyplot(fig)
+                plt.close(fig)
+        if not evr.empty:
+            st.write("설명분산")
+            st.dataframe(evr, use_container_width=True)
 
 elif page == "임상척도":
     st.subheader("질환군 내 임상척도 연결")
-    disease_mask = crf_work[group_col].astype(str).eq(str(disease_label))
-    numeric_candidates = []
-    for c in crf_work.columns:
-        if c in [subject_col, group_col, "institution"]:
-            continue
-        num = pd.to_numeric(crf_work[c], errors="coerce")
-        if num.notna().sum() >= 5:
-            numeric_candidates.append(c)
-    default_clin = [c for c in ["updrs_auto", "hy_stage_auto"] if c in numeric_candidates]
-    clinical_vars = st.multiselect("상관분석 임상척도", numeric_candidates, default=default_clin)
-    if st.button("임상척도 상관분석 실행"):
-        clin_corr = fpca_clinical_correlation(scores_wide, crf_work, subject_col, disease_mask, clinical_vars)
-        st.session_state["clin_corr"] = clin_corr
+    if not st.session_state.get("clinical_done"):
+        st.warning("사이드바에서 `④ 임상 분석 실행`을 누르세요. `④ 임상 분석 실행`은 `③ fPCA 실행` 후 활성화됩니다.")
+        st.caption("임상 변수는 사이드바의 `임상 상관분석 변수`에서 선택합니다.")
     clin_corr = st.session_state.get("clin_corr", pd.DataFrame())
     if not clin_corr.empty:
         st.dataframe(clin_corr, use_container_width=True)
-    else:
-        st.info("질환군 내에서 UPDRS/HY 등 임상척도를 선택하고 실행하세요.")
+    elif st.session_state.get("clinical_done"):
+        st.info("선택한 임상 변수에서 표시 가능한 상관분석 결과가 없습니다.")
 
 elif page == "ML":
     st.subheader("fPCA 기반 leakage-free 로지스틱 회귀")
     st.caption("각 fold 내부에서 공변량 보정과 PCA를 fit하고 test fold는 transform만 수행합니다.")
-    ml_features = st.multiselect("ML feature", sorted(matrices_raw.keys()), default=sorted(matrices_raw.keys())[: min(20, len(matrices_raw))])
-    if st.button("ML 실행"):
-        try:
-            with st.spinner("ML 교차검증 실행 중..."):
-                fold_df, oof_metrics, oof_df, coef_df = run_no_leakage_ml(matrices_raw, crf_work, subject_col, group_col, control_label, disease_label, covariates, ml_features, n_components, n_splits, c_value, int(random_state))
-                st.session_state["ml_fold"] = fold_df
-                st.session_state["ml_oof_metrics"] = oof_metrics
-                st.session_state["ml_oof"] = oof_df
-                st.session_state["ml_coef"] = coef_df
-            st.success("ML 완료")
-        except Exception as e:
-            st.error(f"ML 실패: {e}")
+    if not st.session_state.get("ml_done"):
+        st.warning("사이드바에서 `⑤ ML 실행`을 누르세요. `⑤ ML 실행`은 `④ 임상 분석 실행` 후 활성화됩니다.")
     if "ml_oof_metrics" in st.session_state:
         st.write("OOF 성능")
         st.dataframe(st.session_state["ml_oof_metrics"], use_container_width=True)
@@ -1778,25 +1935,27 @@ elif page == "다운로드":
             "00_input/crf_standardized.csv": crf_work,
             "00_input/subject_mapping.csv": map_df,
             "00_input/group_summary.csv": group_summary,
-            "01_analysis/adjusted_curves_long.csv": adjusted_long,
-            "01_analysis/fda_grid_tests.csv": fda_grid_tests,
-            "01_analysis/fda_significant_intervals.csv": fda_sig_intervals,
-            "02_fpca/fpca_scores_long.csv": scores_long,
-            "02_fpca/fpca_scores_wide.csv": scores_wide,
-            "02_fpca/fpca_loadings_long.csv": loadings_long,
-            "02_fpca/fpca_explained_variance.csv": evr,
-            "02_fpca/fpca_2d_group_tests.csv": tests_2d,
             "99_config/analysis_config.csv": st.session_state.get("analysis_config", pd.DataFrame()),
         }
-        if "clin_corr" in st.session_state:
-            files["03_clinical/fpca_clinical_correlations.csv"] = st.session_state["clin_corr"]
-        if "ml_fold" in st.session_state:
-            files["04_ml/ml_fold_metrics.csv"] = st.session_state["ml_fold"]
-            files["04_ml/ml_oof_metrics.csv"] = st.session_state["ml_oof_metrics"]
-            files["04_ml/ml_oof_predictions.csv"] = st.session_state["ml_oof"]
-            files["04_ml/ml_logistic_coefficients.csv"] = st.session_state["ml_coef"]
+        if st.session_state.get("fda_done"):
+            files["01_fda/adjusted_curves_long.csv"] = adjusted_long
+            files["01_fda/fda_grid_tests.csv"] = fda_grid_tests
+            files["01_fda/fda_significant_intervals.csv"] = fda_sig_intervals
+        if st.session_state.get("fpca_done"):
+            files["02_fpca/fpca_scores_long.csv"] = scores_long
+            files["02_fpca/fpca_scores_wide.csv"] = scores_wide
+            files["02_fpca/fpca_loadings_long.csv"] = loadings_long
+            files["02_fpca/fpca_explained_variance.csv"] = evr
+            files["02_fpca/fpca_2d_group_tests.csv"] = tests_2d
+        if st.session_state.get("clinical_done"):
+            files["03_clinical/fpca_clinical_correlations.csv"] = st.session_state.get("clin_corr", pd.DataFrame())
+        if st.session_state.get("ml_done"):
+            files["04_ml/ml_fold_metrics.csv"] = st.session_state.get("ml_fold", pd.DataFrame())
+            files["04_ml/ml_oof_metrics.csv"] = st.session_state.get("ml_oof_metrics", pd.DataFrame())
+            files["04_ml/ml_oof_predictions.csv"] = st.session_state.get("ml_oof", pd.DataFrame())
+            files["04_ml/ml_logistic_coefficients.csv"] = st.session_state.get("ml_coef", pd.DataFrame())
         extra = {}
-        if include_figures and adjusted:
+        if include_figures and st.session_state.get("fda_done") and adjusted:
             for feat in sorted(list(adjusted.keys())):
                 try:
                     fig = plot_fda_group_mean(
@@ -1808,16 +1967,17 @@ elif page == "다운로드":
                     extra[f"figures/fda_{safe_filename(feat)}.png"] = fig_to_png_bytes(fig)
                 except Exception:
                     pass
-                try:
-                    fig = plot_loading(loadings_long, feat, stance_pct=stance_pct)
-                    extra[f"figures/loading_{safe_filename(feat)}.png"] = fig_to_png_bytes(fig)
-                except Exception:
-                    pass
-                try:
-                    fig = plot_fpca_scatter(scores_long, crf_work, subject_col, group_col, feat, [control_label, disease_label], f"{feat}: FPC1-FPC2")
-                    extra[f"figures/fpca_scatter_{safe_filename(feat)}.png"] = fig_to_png_bytes(fig)
-                except Exception:
-                    pass
+                if st.session_state.get("fpca_done"):
+                    try:
+                        fig = plot_loading(loadings_long, feat, stance_pct=stance_pct)
+                        extra[f"figures/loading_{safe_filename(feat)}.png"] = fig_to_png_bytes(fig)
+                    except Exception:
+                        pass
+                    try:
+                        fig = plot_fpca_scatter(scores_long, crf_work, subject_col, group_col, feat, [control_label, disease_label], f"{feat}: FPC1-FPC2")
+                        extra[f"figures/fpca_scatter_{safe_filename(feat)}.png"] = fig_to_png_bytes(fig)
+                    except Exception:
+                        pass
         st.session_state["analysis_zip"] = dataframe_to_zip_bytes(files, extra)
         st.success("ZIP 생성 완료")
 
@@ -1831,4 +1991,4 @@ elif page == "다운로드":
         )
 
 st.divider()
-st.caption("주의: 이 앱은 원본 MOT/TRC 전처리를 수행하지 않습니다. 입력 gait 데이터는 cycle별 MOT wide table 또는 subject-level mean curve long table이어야 합니다.")
+st.caption("주의: 이 앱은 원본 MOT/TRC 전처리를 수행하지 않습니다. 입력 gait 데이터는 subject-level mean curve long table이어야 하며, cycle-level MOT wide table의 웹 변환은 테스트용입니다.")
