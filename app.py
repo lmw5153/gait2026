@@ -842,21 +842,104 @@ def plot_loading(loadings_long: pd.DataFrame, feature: str, stance_pct: float) -
     return fig
 
 
-def plot_fpca_box(scores_long: pd.DataFrame, meta: pd.DataFrame, subject_col: str, group_col: str, feature: str, pc: str, groups: Sequence[str]) -> plt.Figure:
-    sub = scores_long[scores_long["feature"] == feature].copy()
+def plot_fpca_box(
+    scores_long: pd.DataFrame,
+    meta: pd.DataFrame,
+    subject_col: str,
+    group_col: str,
+    feature: str,
+    pc: str,
+    groups: Sequence[str],
+) -> plt.Figure:
+    sub = scores_long[scores_long["feature"].astype(str) == str(feature)].copy()
+
     meta2 = meta[[subject_col, group_col]].copy()
-    meta2[subject_col] = meta2[subject_col].astype(str)
-    tmp = sub.merge(meta2, left_on="subject_id", right_on=subject_col, how="left")
-    data = [tmp.loc[tmp[group_col].astype(str) == str(g), pc].dropna().to_numpy() for g in groups]
+    meta2[subject_col] = meta2[subject_col].astype(str).str.strip()
+    meta2[group_col] = meta2[group_col].astype(str).str.strip()
+
+    sub["subject_id"] = sub["subject_id"].astype(str).str.strip()
+
+    tmp = sub.merge(
+        meta2,
+        left_on="subject_id",
+        right_on=subject_col,
+        how="left",
+    )
+
     fig, ax = plt.subplots(figsize=(7.4, 4.7))
-    ax.boxplot(data, labels=[str(g) for g in groups], showfliers=False)
-    for i, vals in enumerate(data, start=1):
-        if len(vals):
-            jitter = np.random.default_rng(42 + i).normal(i, 0.035, size=len(vals))
-            ax.scatter(jitter, vals, alpha=0.7, s=35)
+
+    if pc not in tmp.columns:
+        ax.text(
+            0.5,
+            0.5,
+            f"{pc} 컬럼이 없습니다.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        return fig
+
+    plot_data = []
+    plot_labels = []
+
+    for g in groups:
+        vals = pd.to_numeric(
+            tmp.loc[tmp[group_col].astype(str) == str(g), pc],
+            errors="coerce",
+        ).dropna().to_numpy(dtype=float)
+
+        vals = vals[np.isfinite(vals)]
+
+        # 값이 있는 그룹만 boxplot에 포함
+        if len(vals) > 0:
+            plot_data.append(vals)
+            plot_labels.append(str(g))
+
+    if len(plot_data) == 0:
+        ax.text(
+            0.5,
+            0.5,
+            "선택한 feature/PC에서 표시 가능한 그룹 데이터가 없습니다.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+        ax.set_axis_off()
+        fig.tight_layout()
+        return fig
+
+    # matplotlib 3.9+에서는 labels 대신 tick_labels 권장
+    try:
+        ax.boxplot(plot_data, tick_labels=plot_labels, showfliers=False)
+    except TypeError:
+        # 구버전 matplotlib 호환
+        ax.boxplot(plot_data, labels=plot_labels, showfliers=False)
+
+    rng = np.random.default_rng(42)
+    for i, vals in enumerate(plot_data, start=1):
+        jitter = rng.normal(i, 0.035, size=len(vals))
+        ax.scatter(jitter, vals, alpha=0.7, s=35)
+
     ax.set_title(f"{feature} - {pc} 그룹별 분포")
     ax.set_ylabel(f"{pc} score")
     ax.grid(axis="y", alpha=0.25)
+
+    # 그룹 중 하나가 비어 있었으면 그림 안에 알림
+    missing_groups = [str(g) for g in groups if str(g) not in plot_labels]
+    if missing_groups:
+        ax.text(
+            0.01,
+            0.01,
+            "데이터 없음: " + ", ".join(missing_groups),
+            transform=ax.transAxes,
+            fontsize=9,
+            va="bottom",
+            ha="left",
+            alpha=0.75,
+        )
+
     fig.tight_layout()
     return fig
 
