@@ -1,15 +1,23 @@
-# Sample data structure
+# Sample upload structure
 
-실제 데이터는 이 폴더에 넣어 GitHub에 커밋하지 마세요. 앱 업로드용 ZIP은 아래 구조를 따릅니다.
+기관별 ZIP 파일 내부 예시입니다.
 
 ```text
-OpenCap_DATA.zip
-├─ UNI/
-│  └─ UNI1/
-│     ├─ 6m_1.mot
-│     ├─ 6m_1.trc
-│     ├─ 6m_2.mot
-│     └─ 6m_2.trc
-└─ CRF/
-   └─ OpenCap협력연구_피험자정보.xlsx
+UNI_gait.zip
+├─ UNI1/
+│  ├─ 6m_1.mot
+│  ├─ 6m_1.trc
+│  ├─ 6m_2.mot
+│  └─ 6m_2.trc
+└─ UNI2/
+   ├─ 6m_1.mot
+   └─ 6m_1.trc
+```
+
+CRF는 앱에서 같은 기관 업로드 칸에 별도로 올립니다.
+
+```text
+UNI_CRF.xlsx
+UUH_CRF.xlsx
+JBH_CRF.xlsx
 ```
