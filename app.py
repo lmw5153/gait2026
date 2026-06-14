@@ -265,32 +265,34 @@ def standardize_gait_long(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return out, errors
 
 
+
 def cycle_wide_to_subject_mean_long(
     df: pd.DataFrame,
     institution: str,
     n_grid: int = 101,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """
-    cycle별 MOT wide table을 기존 분석 파이프라인용 subject-level long table로 변환한다.
+    cycle별 MOT wide table을 분석용 subject-level long table로 변환한다.
 
-    입력 컬럼 예:
+    입력 예:
         id, side, cycle, t0, t1, to, to_pct, phase, time,
         pelvis_tilt, pelvis_list, ..., hip_flexion_r, ...
 
-    출력 컬럼:
+    출력:
         institution, subject_id, feature, grid_pct, value, n_cycles_total, n_cycles_kept
 
-    원칙:
+    중요:
         - 원본 MOT 변수명은 feature로 그대로 유지한다.
-        - ipsi/contra 등으로 바꾸지 않는다.
-        - cycle별 time을 t0~t1 기준 0~100%로 정규화한 뒤 subject-feature 평균을 낸다.
+        - ipsi/contra 같은 이름 변경을 하지 않는다.
+        - cycle-level long table을 크게 만들지 않고, subject-feature-grid 누적 평균을 바로 계산한다.
+          이 방식이 Streamlit Cloud 메모리와 속도 면에서 훨씬 안전하다.
     """
-    errors: List[str] = []
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), ["cycle wide 데이터가 비어 있습니다."]
 
     work = df.copy()
     work.columns = [_clean_col_name(c) for c in work.columns]
+
     required = ["id", "side", "cycle", "t0", "t1", "time"]
     missing = [c for c in required if c not in work.columns]
     if missing:
@@ -299,7 +301,7 @@ def cycle_wide_to_subject_mean_long(
     inst = str(institution).upper().strip()
     meta_cols = {
         "id", "side", "cycle", "t0", "t1", "to", "to_pct", "phase", "time",
-        "source_file", "institution", "subject_id", "trial_id",
+        "source_file", "institution", "subject_id", "trial_id", "grid_pct", "value",
     }
     numeric_cols = work.select_dtypes(include=[np.number]).columns.tolist()
     feature_cols = [c for c in numeric_cols if c not in meta_cols]
@@ -307,7 +309,6 @@ def cycle_wide_to_subject_mean_long(
     if not feature_cols:
         return pd.DataFrame(), pd.DataFrame(), ["cycle wide table에서 MOT numeric 변수 컬럼을 찾지 못했습니다."]
 
-    # cycle key 구성
     work["id"] = work["id"].astype(str).str.strip()
     work["side"] = work["side"].astype(str).str.strip()
     work["cycle"] = work["cycle"].astype(str).str.strip()
@@ -315,7 +316,9 @@ def cycle_wide_to_subject_mean_long(
     work["cycle_key"] = work["id"] + "::" + work["side"] + "::" + work["cycle"]
 
     grid = np.linspace(0, 100, int(n_grid))
-    cycle_long_parts: List[pd.DataFrame] = []
+    sums: Dict[Tuple[str, str, str], np.ndarray] = {}
+    counts: Dict[Tuple[str, str, str], np.ndarray] = {}
+    cycle_counts: Dict[Tuple[str, str], int] = {}
     cycle_qc_rows: List[dict] = []
 
     for cycle_key, sub in work.groupby("cycle_key", sort=False):
@@ -324,79 +327,110 @@ def cycle_wide_to_subject_mean_long(
         original_id = str(sub["id"].iloc[0])
         side = str(sub["side"].iloc[0])
         cycle_no = str(sub["cycle"].iloc[0])
+
         t = pd.to_numeric(sub["time"], errors="coerce").to_numpy(dtype=float)
         t0_series = pd.to_numeric(sub["t0"], errors="coerce").dropna()
         t1_series = pd.to_numeric(sub["t1"], errors="coerce").dropna()
         t0 = float(t0_series.iloc[0]) if len(t0_series) else np.nan
         t1 = float(t1_series.iloc[0]) if len(t1_series) else np.nan
+
         if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
-            t0 = float(np.nanmin(t)) if np.isfinite(t).any() else np.nan
-            t1 = float(np.nanmax(t)) if np.isfinite(t).any() else np.nan
+            if np.isfinite(t).any():
+                t0 = float(np.nanmin(t))
+                t1 = float(np.nanmax(t))
+
         if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
-            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "invalid_cycle_time"})
+            cycle_qc_rows.append({
+                "institution": inst, "subject_id": sid, "id": original_id,
+                "side": side, "cycle": cycle_no, "status": "invalid_cycle_time",
+            })
             continue
 
         grid_pct_raw = 100.0 * (t - t0) / (t1 - t0)
         ok_t = np.isfinite(grid_pct_raw)
-        grid_pct_raw = grid_pct_raw[ok_t]
-        sub_ok = sub.loc[ok_t].copy()
-        # 0~100 범위 밖은 제외
-        in_range = (grid_pct_raw >= 0) & (grid_pct_raw <= 100)
-        grid_pct_raw = grid_pct_raw[in_range]
-        sub_ok = sub_ok.loc[in_range].copy()
-        if len(grid_pct_raw) < 3:
-            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "too_few_points"})
+        in_range = ok_t & (grid_pct_raw >= 0) & (grid_pct_raw <= 100)
+
+        if int(in_range.sum()) < 3:
+            cycle_qc_rows.append({
+                "institution": inst, "subject_id": sid, "id": original_id,
+                "side": side, "cycle": cycle_no, "status": "too_few_points",
+                "n_points": int(in_range.sum()),
+            })
             continue
 
-        # 중복 time percent가 있으면 평균 처리하기 위해 feature별로 처리
-        feature_frames = []
+        tmp = sub.loc[in_range, feature_cols].copy()
+        tmp.insert(0, "grid_pct_raw", grid_pct_raw[in_range])
+        tmp = tmp.groupby("grid_pct_raw", as_index=False).mean(numeric_only=True).sort_values("grid_pct_raw")
+        x = tmp["grid_pct_raw"].to_numpy(dtype=float)
+
+        if len(x) < 3:
+            cycle_qc_rows.append({
+                "institution": inst, "subject_id": sid, "id": original_id,
+                "side": side, "cycle": cycle_no, "status": "too_few_unique_points",
+                "n_points": len(x),
+            })
+            continue
+
+        ok_features = 0
         for feat in feature_cols:
-            y = pd.to_numeric(sub_ok[feat], errors="coerce").to_numpy(dtype=float)
-            valid = np.isfinite(grid_pct_raw) & np.isfinite(y)
-            if valid.sum() < 3:
-                continue
-            tmp = pd.DataFrame({"grid_pct_raw": grid_pct_raw[valid], "value": y[valid]})
-            tmp = tmp.groupby("grid_pct_raw", as_index=False)["value"].mean().sort_values("grid_pct_raw")
-            if tmp.shape[0] < 3:
+            y = pd.to_numeric(tmp[feat], errors="coerce").to_numpy(dtype=float)
+            valid = np.isfinite(x) & np.isfinite(y)
+            if int(valid.sum()) < 3:
                 continue
             try:
-                y_grid = np.interp(grid, tmp["grid_pct_raw"].to_numpy(dtype=float), tmp["value"].to_numpy(dtype=float))
+                y_grid = np.interp(grid, x[valid], y[valid])
             except Exception:
                 continue
-            feature_frames.append(pd.DataFrame({
-                "institution": inst,
-                "subject_id": sid,
-                "original_id": original_id,
-                "cycle_key": cycle_key,
-                "side": side,
-                "cycle": cycle_no,
-                "feature": feat,
-                "grid_pct": grid,
-                "value": y_grid,
-            }))
 
-        if feature_frames:
-            cycle_long_parts.append(pd.concat(feature_frames, ignore_index=True))
-            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "ok", "n_features": len(feature_frames), "n_points": len(sub_ok)})
+            key = (inst, sid, str(feat))
+            if key not in sums:
+                sums[key] = np.zeros(len(grid), dtype=float)
+                counts[key] = np.zeros(len(grid), dtype=int)
+            sums[key] += y_grid
+            counts[key] += 1
+            ok_features += 1
+
+        if ok_features > 0:
+            cycle_counts[(inst, sid)] = cycle_counts.get((inst, sid), 0) + 1
+            cycle_qc_rows.append({
+                "institution": inst, "subject_id": sid, "id": original_id,
+                "side": side, "cycle": cycle_no, "status": "ok",
+                "n_features": int(ok_features), "n_points": int(in_range.sum()),
+            })
         else:
-            cycle_qc_rows.append({"institution": inst, "subject_id": sid, "id": original_id, "side": side, "cycle": cycle_no, "status": "no_valid_features"})
+            cycle_qc_rows.append({
+                "institution": inst, "subject_id": sid, "id": original_id,
+                "side": side, "cycle": cycle_no, "status": "no_valid_features",
+                "n_points": int(in_range.sum()),
+            })
 
-    if not cycle_long_parts:
+    if not sums:
         return pd.DataFrame(), pd.DataFrame(cycle_qc_rows), ["cycle wide table에서 유효한 cycle-feature curve를 만들지 못했습니다."]
 
-    cycle_long = pd.concat(cycle_long_parts, ignore_index=True)
-    subject_mean = (
-        cycle_long.groupby(["institution", "subject_id", "feature", "grid_pct"], as_index=False)
-        .agg(
-            value=("value", "mean"),
-            n_cycles_total=("cycle_key", "nunique"),
-            n_cycles_kept=("cycle_key", "nunique"),
+    subject_mean_parts: List[pd.DataFrame] = []
+    for (inst_key, sid, feat), sum_arr in sums.items():
+        count_arr = counts[(inst_key, sid, feat)]
+        value_arr = np.divide(
+            sum_arr,
+            count_arr,
+            out=np.full_like(sum_arr, np.nan, dtype=float),
+            where=count_arr > 0,
         )
-    )
-    subject_mean["input_format"] = "cycle_wide_mot_by_cycle"
+        subject_mean_parts.append(pd.DataFrame({
+            "institution": inst_key,
+            "subject_id": sid,
+            "feature": feat,
+            "grid_pct": grid,
+            "value": value_arr,
+            "n_cycles_total": int(cycle_counts.get((inst_key, sid), 0)),
+            "n_cycles_kept": count_arr.astype(int),
+            "input_format": "cycle_wide_mot_by_cycle",
+        }))
+
+    subject_mean = pd.concat(subject_mean_parts, ignore_index=True)
+    subject_mean = subject_mean.dropna(subset=["subject_id", "feature", "grid_pct", "value"])
     qc_df = pd.DataFrame(cycle_qc_rows)
     return subject_mean, qc_df, []
-
 
 def standardize_gait_input(df: pd.DataFrame, institution: str) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     """long-format 또는 cycle-wide-format 전처리 결과를 분석용 subject-level long table로 표준화한다."""
@@ -717,7 +751,14 @@ def matrix_to_long(matrices: Dict[str, pd.DataFrame], value_col: str = "adjusted
     return out[["subject_id", "feature", "grid_pct", value_col]]
 
 
+
+
 def fit_fpca_for_feature(mat: pd.DataFrame, n_components: int = 2) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """feature별 subject × grid curve matrix에 대해 빠른 randomized PCA 기반 fPCA를 수행한다.
+
+    Streamlit Cloud/일부 BLAS 환경에서 np.linalg.eigh가 작은 행렬에도 과도하게 느려질 수 있어
+    sklearn PCA(svd_solver="randomized")를 사용한다.
+    """
     mat_num = mat.apply(pd.to_numeric, errors="coerce")
     valid_subject = mat_num.notna().mean(axis=1) >= 0.8
     mat_num = mat_num.loc[valid_subject]
@@ -726,9 +767,16 @@ def fit_fpca_for_feature(mat: pd.DataFrame, n_components: int = 2) -> Tuple[pd.D
 
     imp = SimpleImputer(strategy="mean")
     X = imp.fit_transform(mat_num)
-    n_comp = max(1, min(n_components, X.shape[0] - 1, X.shape[1]))
-    pca = PCA(n_components=n_comp, random_state=42)
+    if not np.isfinite(X).all() or float(np.nanvar(X, axis=0).sum()) <= 1e-12:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    n_comp = max(1, min(int(n_components), X.shape[0] - 1, X.shape[1]))
+    if n_comp < 1:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    pca = PCA(n_components=n_comp, svd_solver="randomized", random_state=42)
     scores = pca.fit_transform(X)
+    components = pca.components_
+    evr = pca.explained_variance_ratio_
 
     score_df = pd.DataFrame({"subject_id": mat_num.index.astype(str)})
     for j in range(n_comp):
@@ -737,15 +785,14 @@ def fit_fpca_for_feature(mat: pd.DataFrame, n_components: int = 2) -> Tuple[pd.D
     grid = mat_num.columns.astype(float).to_numpy()
     loading_rows = []
     for j in range(n_comp):
-        for gp, loading in zip(grid, pca.components_[j]):
+        for gp, loading in zip(grid, components[j]):
             loading_rows.append({"component": f"FPC{j + 1}", "grid_pct": float(gp), "loading": float(loading)})
     loading_df = pd.DataFrame(loading_rows)
     evr_df = pd.DataFrame({
         "component": [f"FPC{j + 1}" for j in range(n_comp)],
-        "explained_variance_ratio": pca.explained_variance_ratio_,
+        "explained_variance_ratio": evr,
     })
     return score_df, loading_df, evr_df
-
 
 def run_fpca_all_features(matrices: Dict[str, pd.DataFrame], n_components: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     score_rows: List[pd.DataFrame] = []
@@ -1235,6 +1282,8 @@ def fpca_clinical_correlation(scores_wide: pd.DataFrame, meta: pd.DataFrame, sub
     return out
 
 
+
+
 def transform_feature_train_test_no_leakage(mat: pd.DataFrame, meta: pd.DataFrame, subject_col: str, covariates: Sequence[str], train_subjects: Sequence[str], test_subjects: Sequence[str], n_components: int) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
     mat2 = mat.copy()
     mat2.index = mat2.index.astype(str)
@@ -1276,15 +1325,15 @@ def transform_feature_train_test_no_leakage(mat: pd.DataFrame, meta: pd.DataFram
     imp = SimpleImputer(strategy="mean")
     Xtr = imp.fit_transform(train_adj)
     Xte = imp.transform(test_adj)
-    max_comp = min(n_components, Xtr.shape[0] - 1, Xtr.shape[1])
-    if max_comp < 1:
+    max_comp = min(int(n_components), Xtr.shape[0] - 1, Xtr.shape[1])
+    if max_comp < 1 or (not np.isfinite(Xtr).all()) or float(np.nanvar(Xtr, axis=0).sum()) <= 1e-12:
         return pd.DataFrame(index=train_subjects), pd.DataFrame(index=test_subjects), []
-    pca = PCA(n_components=max_comp, random_state=42)
+
+    pca = PCA(n_components=max_comp, svd_solver="randomized", random_state=42)
     Ztr = pca.fit_transform(Xtr)
     Zte = pca.transform(Xte)
     cols = [f"FPC{i + 1}" for i in range(max_comp)]
     return pd.DataFrame(Ztr, index=train_subjects, columns=cols), pd.DataFrame(Zte, index=test_subjects, columns=cols), cols
-
 
 def compute_binary_metrics(y_true: np.ndarray, prob: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
     ok = np.isfinite(prob) & np.isfinite(y_true)
@@ -1341,7 +1390,7 @@ def run_no_leakage_ml(raw_matrices: Dict[str, pd.DataFrame], meta: pd.DataFrame,
         scaler = StandardScaler()
         Xtr = scaler.fit_transform(imp.fit_transform(X_train))
         Xte = scaler.transform(imp.transform(X_test))
-        clf = LogisticRegression(C=c_value, penalty="l2", solver="liblinear", class_weight="balanced", random_state=random_state)
+        clf = LogisticRegression(C=c_value, solver="liblinear", class_weight="balanced", random_state=random_state)
         clf.fit(Xtr, y_train)
         prob = clf.predict_proba(Xte)[:, 1]
         oof_prob[te_idx] = prob
@@ -1482,7 +1531,7 @@ with st.sidebar:
     covariates = st.multiselect("공변량 보정 변수", crf.columns.tolist(), default=candidate_covs)
 
     all_features = sorted(raw_long["feature"].dropna().astype(str).unique().tolist())
-    default_features = all_features[: min(12, len(all_features))]
+    default_features = all_features
     selected_features = st.multiselect("분석 feature", all_features, default=default_features)
 
     analyze_clicked = st.button("② 분석 시작", type="primary", use_container_width=True)
@@ -1587,8 +1636,8 @@ fda_grid_tests: pd.DataFrame = st.session_state.get("fda_grid_tests", pd.DataFra
 fda_sig_intervals: pd.DataFrame = st.session_state.get("fda_sig_intervals", pd.DataFrame())
 
 if page == "FDA":
-    st.subheader("FDA mean curve: 전체 feature")
-    st.caption("노란색 영역은 grid별 Welch t-test 후 feature별 FDR q-value가 α 미만인 구간입니다.")
+    st.subheader("FDA mean curve")
+    st.caption("분석은 전체 선택 feature에 대해 수행하고, 화면에는 선택한 feature만 표시합니다. 전체 grid별 검정과 유의구간은 다운로드 ZIP의 CSV로 제공합니다. 노란색 영역은 grid별 Welch t-test 후 feature별 FDR q-value가 α 미만인 구간입니다.")
     if not adjusted:
         st.error("보정 curve가 없습니다.")
     else:
@@ -1598,34 +1647,37 @@ if page == "FDA":
         else:
             st.dataframe(fda_sig_intervals, use_container_width=True)
 
-        st.write("Grid별 FDA 검정 테이블")
-        if fda_grid_tests.empty:
-            st.info("grid별 검정 결과가 없습니다. 그룹별 표본 수를 확인하세요.")
-        else:
-            st.dataframe(fda_grid_tests, use_container_width=True)
+        with st.expander("Grid별 FDA 검정 테이블 보기", expanded=False):
+            if fda_grid_tests.empty:
+                st.info("grid별 검정 결과가 없습니다. 그룹별 표본 수를 확인하세요.")
+            else:
+                st.dataframe(fda_grid_tests, use_container_width=True)
 
         st.divider()
-        st.write("전체 FDA 그래프")
-        for feat in sorted(adjusted.keys()):
-            st.markdown(f"### {feat}")
-            fig = plot_fda_group_mean(
-                adjusted[feat],
-                crf_work,
-                subject_col,
-                group_col,
-                [control_label, disease_label],
-                f"{feat}: {control_label} vs {disease_label}",
-                stance_pct=stance_pct,
-                show_significance=True,
-                alpha=alpha,
-                sig_table=fda_grid_tests,
-                feature=feat,
-            )
-            st.pyplot(fig)
-            plt.close(fig)
-            feat_intervals = fda_sig_intervals[fda_sig_intervals["feature"].astype(str).eq(str(feat))] if not fda_sig_intervals.empty else pd.DataFrame()
-            if not feat_intervals.empty:
-                st.dataframe(feat_intervals, use_container_width=True)
+        available_fda_features = sorted(adjusted.keys())
+        if not fda_sig_intervals.empty:
+            sig_order = fda_sig_intervals.groupby("feature")["n_grid"].sum().sort_values(ascending=False).index.astype(str).tolist()
+            available_fda_features = sig_order + [f for f in available_fda_features if f not in sig_order]
+        feat = st.selectbox("FDA 그래프 feature 선택", available_fda_features, key="fda_feat_select")
+        fig = plot_fda_group_mean(
+            adjusted[feat],
+            crf_work,
+            subject_col,
+            group_col,
+            [control_label, disease_label],
+            f"{feat}: {control_label} vs {disease_label}",
+            stance_pct=stance_pct,
+            show_significance=True,
+            alpha=alpha,
+            sig_table=fda_grid_tests,
+            feature=feat,
+        )
+        st.pyplot(fig)
+        plt.close(fig)
+        feat_intervals = fda_sig_intervals[fda_sig_intervals["feature"].astype(str).eq(str(feat))] if not fda_sig_intervals.empty else pd.DataFrame()
+        if not feat_intervals.empty:
+            st.write("선택 feature 유의구간")
+            st.dataframe(feat_intervals, use_container_width=True)
 
 elif page == "fPCA":
     st.subheader("fPCA 결과")
@@ -1718,7 +1770,7 @@ elif page == "ML":
 
 elif page == "다운로드":
     st.subheader("전체 분석 자료 다운로드")
-    include_figures = st.checkbox("주요 PNG 그래프 포함", value=True)
+    include_figures = st.checkbox("주요 PNG 그래프 포함", value=False)
     if st.button("전체 분석 ZIP 생성/갱신"):
         files = {
             "00_input/preprocessed_gait_long.csv": raw_long,
